@@ -1,472 +1,423 @@
 #include <Arduino.h>
 
-// Motor command struct for binary communication
-// Positive values = forward, negative = backward, 0 = stop
-// Magnitude represents speed (1-127 maps to 35%-100% duty cycle)
-struct MotorCommand {
-  int8_t focus;  // -127 to +127 (sign=direction, magnitude=speed)
-  int8_t zoom;   // -127 to +127 (sign=direction, magnitude=speed)
+// ── Protocol structs ──────────────────────────────────────────────────────────
+
+struct FinderCommand {
+    int8_t  focus;  // -127..+127 (sign=direction, magnitude=speed)
+    int8_t  zoom;
+    uint8_t crc;    // CRC8 Dallas/Maxim over [focus, zoom]
 } __attribute__((packed));
 
-// Motor pin definitions - MX1508 dual H-bridge
-// Focus motor (Motor A) - connected to second H-bridge
-#define FOCUS_IN1 5
-#define FOCUS_IN2 4
+struct FinderStatus {
+    uint8_t  flags;            // bit0=focus_active, bit1=zoom_active
+    uint8_t  endstops;         // bit0=f_min, bit1=f_max, bit2=z_min, bit3=z_max
+    uint8_t  last_error;       // 0=none, 1=watchdog, 2=endstop_rejected, 3=bad_frame
+    uint16_t focus_active_ms;  // accumulated drive time since last endstop reset
+    uint16_t zoom_active_ms;
+    uint8_t  focus_pwm;        // current duty cycle 0-255
+    uint8_t  zoom_pwm;
+    uint8_t  crc;
+} __attribute__((packed));
 
-// Zoom motor (Motor B) - connected to first H-bridge
-#define ZOOM_IN3 7
-#define ZOOM_IN4 6
+// ── Pin definitions ───────────────────────────────────────────────────────────
 
-// Optical endstop pin definitions (interrupted by default, optical contact at limit)
+#define FOCUS_IN1         5
+#define FOCUS_IN2         4
+#define ZOOM_IN3          7
+#define ZOOM_IN4          6
 #define FOCUS_ENDSTOP_MIN 2
 #define FOCUS_ENDSTOP_MAX 3
-#define ZOOM_ENDSTOP_MIN 1
-#define ZOOM_ENDSTOP_MAX 0
+#define ZOOM_ENDSTOP_MIN  1
+#define ZOOM_ENDSTOP_MAX  0
 
-// PWM configuration
-#define PWM_FREQ 20000      // 20 kHz PWM frequency
-#define PWM_RESOLUTION 8    // 8-bit resolution (0-255)
-#define DEFAULT_SPEED 255   // Default full speed (can be adjusted 0-255)
+// ── PWM ───────────────────────────────────────────────────────────────────────
 
-// Motor state tracking
-bool focusMotorActive = false;
-bool zoomMotorActive = false;
+#define PWM_FREQ       20000
+#define PWM_RESOLUTION 8
 
-// Motor direction tracking: 0=stopped, 1=forward, -1=backward
-int focusMotorDirection = 0;
-int zoomMotorDirection = 0;
+// ── Timing ───────────────────────────────────────────────────────────────────
 
-// Motor speed tracking (0-255)
-int focusMotorSpeed = DEFAULT_SPEED;
-int zoomMotorSpeed = DEFAULT_SPEED;
+#define WATCHDOG_TIMEOUT_MS 500
+#define STATUS_INTERVAL_MS  100
+#define DEBOUNCE_DELAY_MS   15
 
-// Endstop state tracking (to detect changes)
-bool focusMinLastState = HIGH;
-bool focusMaxLastState = HIGH;
-bool zoomMinLastState = HIGH;
-bool zoomMaxLastState = HIGH;
+// ── Motor state ───────────────────────────────────────────────────────────────
 
-// Debounce timing
+bool    focusMotorActive    = false;
+int     focusMotorDirection = 0;    // 0, 1, -1
+uint8_t focusMotorPwm       = 0;
+
+bool    zoomMotorActive     = false;
+int     zoomMotorDirection  = 0;
+uint8_t zoomMotorPwm        = 0;
+
+// ── Active-time tracking (pseudo-encoder) ─────────────────────────────────────
+
+uint32_t focusActiveAccumMs = 0;   // accumulated ms while motor was driven
+uint32_t focusMoveStartMs   = 0;   // millis() when current run started
+uint32_t zoomActiveAccumMs  = 0;
+uint32_t zoomMoveStartMs    = 0;
+
+// ── Endstop debounce ──────────────────────────────────────────────────────────
+
+bool          focusMinLastState       = HIGH;
+bool          focusMaxLastState       = HIGH;
+bool          zoomMinLastState        = HIGH;
+bool          zoomMaxLastState        = HIGH;
 unsigned long focusMinLastTriggerTime = 0;
 unsigned long focusMaxLastTriggerTime = 0;
-unsigned long zoomMinLastTriggerTime = 0;
-unsigned long zoomMaxLastTriggerTime = 0;
-const unsigned long DEBOUNCE_DELAY = 200; // 200ms debounce time
+unsigned long zoomMinLastTriggerTime  = 0;
+unsigned long zoomMaxLastTriggerTime  = 0;
 
-// Command buffer
-String commandBuffer = "";
+// ── Protocol state ────────────────────────────────────────────────────────────
 
-// Function to stop focus motor
+bool     firstFrameReceived = false;
+uint32_t lastValidFrameMs   = 0;
+bool     watchdogTripped    = false;
+uint8_t  lastError          = 0;
+
+uint8_t  rxBuf[16];
+uint8_t  rxLen = 0;
+
+uint32_t lastStatusMs = 0;
+
+// ── CRC8 Dallas/Maxim (polynomial 0x31) ──────────────────────────────────────
+
+static uint8_t crc8(const uint8_t* data, size_t len) {
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+// ── COBS encode ───────────────────────────────────────────────────────────────
+// out must be at least (len + 2) bytes. Returns total bytes written (incl. 0x00).
+
+static size_t cobsEncode(const uint8_t* in, size_t len, uint8_t* out) {
+    size_t  outIdx  = 0;
+    size_t  codeIdx = outIdx++;
+    uint8_t code    = 1;
+
+    for (size_t i = 0; i < len; i++) {
+        if (in[i] == 0x00) {
+            out[codeIdx] = code;
+            codeIdx = outIdx++;
+            code = 1;
+        } else {
+            out[outIdx++] = in[i];
+            code++;
+            if (code == 0xFF) {
+                out[codeIdx] = code;
+                codeIdx = outIdx++;
+                code = 1;
+            }
+        }
+    }
+    out[codeIdx]  = code;
+    out[outIdx++] = 0x00;
+    return outIdx;
+}
+
+// ── COBS decode ───────────────────────────────────────────────────────────────
+// in: encoded bytes WITHOUT the 0x00 terminator. Returns decoded length, 0 on error.
+
+static size_t cobsDecode(const uint8_t* in, size_t len, uint8_t* out) {
+    size_t inIdx  = 0;
+    size_t outIdx = 0;
+
+    while (inIdx < len) {
+        uint8_t code = in[inIdx++];
+        if (code == 0) return 0;
+
+        for (uint8_t i = 1; i < code; i++) {
+            if (inIdx >= len) return 0;
+            out[outIdx++] = in[inIdx++];
+        }
+        if (code != 0xFF && inIdx < len)
+            out[outIdx++] = 0x00;
+    }
+    return outIdx;
+}
+
+// ── Motor stop functions ──────────────────────────────────────────────────────
+
 void focusStop() {
-  // Detach PWM/LEDC channels to prevent buzzing
-  ledcDetachPin(FOCUS_IN1);
-  ledcDetachPin(FOCUS_IN2);
-  // Set pins to OUTPUT mode and both HIGH for active brake (shorts motor windings)
-  pinMode(FOCUS_IN1, OUTPUT);
-  pinMode(FOCUS_IN2, OUTPUT);
-  digitalWrite(FOCUS_IN1, HIGH);
-  digitalWrite(FOCUS_IN2, HIGH);
-  focusMotorActive = false;
-  focusMotorDirection = 0;
-  Serial.println("[DEBUG] Focus motor: STOPPED (brake mode)");
+    if (focusMotorActive)
+        focusActiveAccumMs += millis() - focusMoveStartMs;
+
+    ledcDetachPin(FOCUS_IN1);
+    ledcDetachPin(FOCUS_IN2);
+    pinMode(FOCUS_IN1, OUTPUT);
+    pinMode(FOCUS_IN2, OUTPUT);
+    digitalWrite(FOCUS_IN1, HIGH);
+    digitalWrite(FOCUS_IN2, HIGH);
+
+    focusMotorActive    = false;
+    focusMotorDirection = 0;
+    focusMotorPwm       = 0;
 }
 
-// Function to move focus motor forward
-void focusForward() {
-  // Check if MAX endstop is triggered
-  if (digitalRead(FOCUS_ENDSTOP_MAX) == LOW) {
-    Serial.println("[ERROR] Cannot move focus forward - MAX endstop triggered!");
-    focusStop();
-    return;
-  }
-  // Properly detach and clear IN2
-  ledcDetachPin(FOCUS_IN2);
-  pinMode(FOCUS_IN2, OUTPUT);
-  digitalWrite(FOCUS_IN2, LOW);
-  // Set IN1 with PWM
-  analogWrite(FOCUS_IN1, focusMotorSpeed);
-  focusMotorActive = true;
-  focusMotorDirection = 1;
-  Serial.print("[DEBUG] Focus motor: FORWARD (speed: ");
-  Serial.print(focusMotorSpeed);
-  Serial.println(")");
-}
-
-// Function to move focus motor backward
-void focusBack() {
-  // Check if MIN endstop is triggered
-  if (digitalRead(FOCUS_ENDSTOP_MIN) == LOW) {
-    Serial.println("[ERROR] Cannot move focus backward - MIN endstop triggered!");
-    focusStop();
-    return;
-  }
-  // Properly detach and clear IN1
-  ledcDetachPin(FOCUS_IN1);
-  pinMode(FOCUS_IN1, OUTPUT);
-  digitalWrite(FOCUS_IN1, LOW);
-  // Set IN2 with PWM
-  analogWrite(FOCUS_IN2, focusMotorSpeed);
-  focusMotorActive = true;
-  focusMotorDirection = -1;
-  Serial.print("[DEBUG] Focus motor: BACKWARD (speed: ");
-  Serial.print(focusMotorSpeed);
-  Serial.println(")");
-}
-
-// Function to stop zoom motor
 void zoomStop() {
-  // Detach PWM/LEDC channels to prevent buzzing
-  ledcDetachPin(ZOOM_IN3);
-  ledcDetachPin(ZOOM_IN4);
-  // Set pins to OUTPUT mode and both HIGH for active brake (shorts motor windings)
-  pinMode(ZOOM_IN3, OUTPUT);
-  pinMode(ZOOM_IN4, OUTPUT);
-  digitalWrite(ZOOM_IN3, HIGH);
-  digitalWrite(ZOOM_IN4, HIGH);
-  zoomMotorActive = false;
-  zoomMotorDirection = 0;
-  Serial.println("[DEBUG] Zoom motor: STOPPED (brake mode)");
+    if (zoomMotorActive)
+        zoomActiveAccumMs += millis() - zoomMoveStartMs;
+
+    ledcDetachPin(ZOOM_IN3);
+    ledcDetachPin(ZOOM_IN4);
+    pinMode(ZOOM_IN3, OUTPUT);
+    pinMode(ZOOM_IN4, OUTPUT);
+    digitalWrite(ZOOM_IN3, HIGH);
+    digitalWrite(ZOOM_IN4, HIGH);
+
+    zoomMotorActive    = false;
+    zoomMotorDirection = 0;
+    zoomMotorPwm       = 0;
 }
 
-// Function to move zoom motor forward
-void zoomForward() {
-  // Check if MAX endstop is triggered
-  if (digitalRead(ZOOM_ENDSTOP_MAX) == LOW) {
-    Serial.println("[ERROR] Cannot move zoom forward - MAX endstop triggered!");
-    zoomStop();
-    return;
-  }
-  // Properly detach and clear IN3
-  ledcDetachPin(ZOOM_IN3);
-  pinMode(ZOOM_IN3, OUTPUT);
-  digitalWrite(ZOOM_IN3, LOW);
-  // Set IN4 with PWM
-  analogWrite(ZOOM_IN4, zoomMotorSpeed);
-  zoomMotorActive = true;
-  zoomMotorDirection = 1;
-  Serial.print("[DEBUG] Zoom motor: FORWARD (speed: ");
-  Serial.print(zoomMotorSpeed);
-  Serial.println(")");
-}
+// ── Motor move functions ──────────────────────────────────────────────────────
 
-// Function to move zoom motor backward
-void zoomBack() {
-  // Check if MIN endstop is triggered
-  if (digitalRead(ZOOM_ENDSTOP_MIN) == LOW) {
-    Serial.println("[ERROR] Cannot move zoom backward - MIN endstop triggered!");
-    zoomStop();
-    return;
-  }
-  // Properly detach and clear IN4
-  ledcDetachPin(ZOOM_IN4);
-  pinMode(ZOOM_IN4, OUTPUT);
-  digitalWrite(ZOOM_IN4, LOW);
-  // Set IN3 with PWM
-  analogWrite(ZOOM_IN3, zoomMotorSpeed);
-  zoomMotorActive = true;
-  zoomMotorDirection = -1;
-  Serial.print("[DEBUG] Zoom motor: BACKWARD (speed: ");
-  Serial.print(zoomMotorSpeed);
-  Serial.println(")");
-}
-
-// Function to process binary motor command struct
-void processMotorCommand(MotorCommand cmd) {
-  Serial.println("[DEBUG] Received binary motor command");
-  Serial.print("  Focus: ");
-  Serial.print(cmd.focus);
-  Serial.print(", Zoom: ");
-  Serial.println(cmd.zoom);
-
-  // Process focus motor command
-  if (cmd.focus > 0) {
-    // Forward: map 1-127 to speed 89-255 (35%-100% duty cycle)
-    // This ensures minimum speed has enough torque to overcome static friction
-    focusMotorSpeed = map(abs(cmd.focus), 1, 127, 89, 255);
-    focusForward();
-  } else if (cmd.focus < 0) {
-    // Backward: map -1 to -127 to speed 89-255 (35%-100% duty cycle)
-    focusMotorSpeed = map(abs(cmd.focus), 1, 127, 89, 255);
-    focusBack();
-  } else {
-    // Stop
-    focusStop();
-  }
-
-  // Process zoom motor command
-  if (cmd.zoom > 0) {
-    // Forward: map 1-127 to speed 89-255 (35%-100% duty cycle)
-    zoomMotorSpeed = map(abs(cmd.zoom), 1, 127, 89, 255);
-    zoomForward();
-  } else if (cmd.zoom < 0) {
-    // Backward: map -1 to -127 to speed 89-255 (35%-100% duty cycle)
-    zoomMotorSpeed = map(abs(cmd.zoom), 1, 127, 89, 255);
-    zoomBack();
-  } else {
-    // Stop
-    zoomStop();
-  }
-}
-
-// Function to process incoming text commands (for backward compatibility)
-void processCommand(String command) {
-  command.trim(); // Remove any whitespace
-  command.toLowerCase(); // Convert to lowercase for easier comparison
-
-  Serial.print("[DEBUG] Received text command: '");
-  Serial.print(command);
-  Serial.println("'");
-
-  if (command == "focus_stop") {
-    focusStop();
-  } else if (command == "focus_forward") {
-    focusForward();
-  } else if (command == "focus_back") {
-    focusBack();
-  } else if (command == "zoom_stop") {
-    zoomStop();
-  } else if (command == "zoom_forward") {
-    zoomForward();
-  } else if (command == "zoom_back") {
-    zoomBack();
-  } else if (command.startsWith("focus_speed ")) {
-    // Parse speed value (0-255)
-    int speed = command.substring(12).toInt();
-    if (speed >= 0 && speed <= 255) {
-      focusMotorSpeed = speed;
-      Serial.print("[DEBUG] Focus motor speed set to: ");
-      Serial.println(focusMotorSpeed);
-    } else {
-      Serial.println("[ERROR] Invalid speed value. Must be 0-255.");
+void focusForward(uint8_t pwm) {
+    if (digitalRead(FOCUS_ENDSTOP_MAX) == LOW) {
+        focusStop();
+        lastError = 2;
+        return;
     }
-  } else if (command.startsWith("zoom_speed ")) {
-    // Parse speed value (0-255)
-    int speed = command.substring(11).toInt();
-    if (speed >= 0 && speed <= 255) {
-      zoomMotorSpeed = speed;
-      Serial.print("[DEBUG] Zoom motor speed set to: ");
-      Serial.println(zoomMotorSpeed);
-    } else {
-      Serial.println("[ERROR] Invalid speed value. Must be 0-255.");
-    }
-  } else {
-    Serial.print("[ERROR] Unknown command: '");
-    Serial.print(command);
-    Serial.println("'");
-    Serial.println("[INFO] Available commands:");
-    Serial.println("  - Text: focus_stop, focus_forward, focus_back");
-    Serial.println("  - Text: zoom_stop, zoom_forward, zoom_back");
-    Serial.println("  - Text: focus_speed <0-255>, zoom_speed <0-255>");
-    Serial.println("  - Binary: Send MotorCommand struct (4 bytes)");
-  }
+    ledcDetachPin(FOCUS_IN2);
+    pinMode(FOCUS_IN2, OUTPUT);
+    digitalWrite(FOCUS_IN2, LOW);
+    analogWrite(FOCUS_IN1, pwm);
+
+    if (!focusMotorActive) focusMoveStartMs = millis();
+    focusMotorActive    = true;
+    focusMotorDirection = 1;
+    focusMotorPwm       = pwm;
 }
+
+void focusBack(uint8_t pwm) {
+    if (digitalRead(FOCUS_ENDSTOP_MIN) == LOW) {
+        focusStop();
+        lastError = 2;
+        return;
+    }
+    ledcDetachPin(FOCUS_IN1);
+    pinMode(FOCUS_IN1, OUTPUT);
+    digitalWrite(FOCUS_IN1, LOW);
+    analogWrite(FOCUS_IN2, pwm);
+
+    if (!focusMotorActive) focusMoveStartMs = millis();
+    focusMotorActive    = true;
+    focusMotorDirection = -1;
+    focusMotorPwm       = pwm;
+}
+
+void zoomForward(uint8_t pwm) {
+    if (digitalRead(ZOOM_ENDSTOP_MAX) == LOW) {
+        zoomStop();
+        lastError = 2;
+        return;
+    }
+    ledcDetachPin(ZOOM_IN3);
+    pinMode(ZOOM_IN3, OUTPUT);
+    digitalWrite(ZOOM_IN3, LOW);
+    analogWrite(ZOOM_IN4, pwm);
+
+    if (!zoomMotorActive) zoomMoveStartMs = millis();
+    zoomMotorActive    = true;
+    zoomMotorDirection = 1;
+    zoomMotorPwm       = pwm;
+}
+
+void zoomBack(uint8_t pwm) {
+    if (digitalRead(ZOOM_ENDSTOP_MIN) == LOW) {
+        zoomStop();
+        lastError = 2;
+        return;
+    }
+    ledcDetachPin(ZOOM_IN4);
+    pinMode(ZOOM_IN4, OUTPUT);
+    digitalWrite(ZOOM_IN4, LOW);
+    analogWrite(ZOOM_IN3, pwm);
+
+    if (!zoomMotorActive) zoomMoveStartMs = millis();
+    zoomMotorActive    = true;
+    zoomMotorDirection = -1;
+    zoomMotorPwm       = pwm;
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+static void processMotorCommand(const FinderCommand& cmd) {
+    if (cmd.focus > 0)
+        focusForward((uint8_t)map(abs(cmd.focus), 1, 127, 89, 255));
+    else if (cmd.focus < 0)
+        focusBack((uint8_t)map(abs(cmd.focus), 1, 127, 89, 255));
+    else
+        focusStop();
+
+    if (cmd.zoom > 0)
+        zoomForward((uint8_t)map(abs(cmd.zoom), 1, 127, 89, 255));
+    else if (cmd.zoom < 0)
+        zoomBack((uint8_t)map(abs(cmd.zoom), 1, 127, 89, 255));
+    else
+        zoomStop();
+}
+
+// ── Status frame transmission ─────────────────────────────────────────────────
+
+static void sendStatus() {
+    uint32_t now = millis();
+
+    // Include current run time without modifying the accumulators
+    uint32_t fTotal = focusActiveAccumMs + (focusMotorActive ? (now - focusMoveStartMs) : 0);
+    uint32_t zTotal = zoomActiveAccumMs  + (zoomMotorActive  ? (now - zoomMoveStartMs)  : 0);
+
+    bool fMin = (digitalRead(FOCUS_ENDSTOP_MIN) == LOW);
+    bool fMax = (digitalRead(FOCUS_ENDSTOP_MAX) == LOW);
+    bool zMin = (digitalRead(ZOOM_ENDSTOP_MIN)  == LOW);
+    bool zMax = (digitalRead(ZOOM_ENDSTOP_MAX)  == LOW);
+
+    FinderStatus st;
+    st.flags           = (focusMotorActive ? 0x01 : 0x00) | (zoomMotorActive ? 0x02 : 0x00);
+    st.endstops        = (fMin ? 0x01 : 0) | (fMax ? 0x02 : 0) | (zMin ? 0x04 : 0) | (zMax ? 0x08 : 0);
+    st.last_error      = lastError;
+    st.focus_active_ms = (uint16_t)(fTotal > 65535UL ? 65535UL : fTotal);
+    st.zoom_active_ms  = (uint16_t)(zTotal > 65535UL ? 65535UL : zTotal);
+    st.focus_pwm       = focusMotorPwm;
+    st.zoom_pwm        = zoomMotorPwm;
+    st.crc             = crc8((const uint8_t*)&st, sizeof(st) - 1);
+
+    uint8_t frame[sizeof(FinderStatus) + 2];
+    size_t  frameLen = cobsEncode((const uint8_t*)&st, sizeof(st), frame);
+    Serial.write(frame, frameLen);
+}
+
+// ── setup() ──────────────────────────────────────────────────────────────────
 
 void setup() {
-  // Initialize serial communication at 115200 baud rate
-  Serial.begin(115200);
+    Serial.begin(115200);
+    delay(2000);
+    while (!Serial && millis() < 5000) delay(100);
 
-  // Wait for serial port to connect (ESP32-C3 needs more time for USB CDC)
-  delay(2000);
+    pinMode(FOCUS_IN1, OUTPUT);
+    pinMode(FOCUS_IN2, OUTPUT);
+    pinMode(ZOOM_IN3,  OUTPUT);
+    pinMode(ZOOM_IN4,  OUTPUT);
 
-  // Force a flush to ensure serial is ready
-  while (!Serial && millis() < 5000) {
-    delay(100);
-  }
+    pinMode(FOCUS_ENDSTOP_MIN, INPUT_PULLUP);
+    pinMode(FOCUS_ENDSTOP_MAX, INPUT_PULLUP);
+    pinMode(ZOOM_ENDSTOP_MIN,  INPUT_PULLUP);
+    pinMode(ZOOM_ENDSTOP_MAX,  INPUT_PULLUP);
 
-  // Configure motor pins as outputs
-  pinMode(FOCUS_IN1, OUTPUT);
-  pinMode(FOCUS_IN2, OUTPUT);
-  pinMode(ZOOM_IN3, OUTPUT);
-  pinMode(ZOOM_IN4, OUTPUT);
+    focusStop();
+    zoomStop();
 
-  // Configure optical endstop pins as inputs with pull-ups
-  pinMode(FOCUS_ENDSTOP_MIN, INPUT_PULLUP);
-  pinMode(FOCUS_ENDSTOP_MAX, INPUT_PULLUP);
-  pinMode(ZOOM_ENDSTOP_MIN, INPUT_PULLUP);
-  pinMode(ZOOM_ENDSTOP_MAX, INPUT_PULLUP);
+    focusMinLastState = digitalRead(FOCUS_ENDSTOP_MIN);
+    focusMaxLastState = digitalRead(FOCUS_ENDSTOP_MAX);
+    zoomMinLastState  = digitalRead(ZOOM_ENDSTOP_MIN);
+    zoomMaxLastState  = digitalRead(ZOOM_ENDSTOP_MAX);
 
-  // Initialize all motors to stopped state
-  focusStop();
-  zoomStop();
-
-  Serial.println("========================================");
-  Serial.println("Motorized CCTV Controller - MX1508 H-Bridge");
-  Serial.println("========================================");
-  Serial.println("[INFO] System initialized successfully!");
-  Serial.println("[INFO] Focus motor pins: IN1=GPIO5, IN2=GPIO4");
-  Serial.println("[INFO] Zoom motor pins: IN3=GPIO7, IN4=GPIO6");
-  Serial.println("[INFO] Focus endstops: MIN=GPIO2, MAX=GPIO3");
-  Serial.println("[INFO] Zoom endstops: MIN=GPIO1, MAX=GPIO0");
-  Serial.println("[INFO] PWM Configuration:");
-  Serial.print("  - Frequency: ");
-  Serial.print(PWM_FREQ);
-  Serial.println(" Hz");
-  Serial.print("  - Resolution: ");
-  Serial.print(PWM_RESOLUTION);
-  Serial.println(" bits (0-255)");
-  Serial.print("  - Default speed: ");
-  Serial.println(DEFAULT_SPEED);
-
-  // Read and display initial endstop states
-  Serial.println("[INFO] Initial endstop states:");
-  Serial.print("  Focus MIN (GPIO2): ");
-  Serial.println(digitalRead(FOCUS_ENDSTOP_MIN) == HIGH ? "HIGH (not triggered)" : "LOW (triggered)");
-  Serial.print("  Focus MAX (GPIO3): ");
-  Serial.println(digitalRead(FOCUS_ENDSTOP_MAX) == HIGH ? "HIGH (not triggered)" : "LOW (triggered)");
-  Serial.print("  Zoom MIN (GPIO1): ");
-  Serial.println(digitalRead(ZOOM_ENDSTOP_MIN) == HIGH ? "HIGH (not triggered)" : "LOW (triggered)");
-  Serial.print("  Zoom MAX (GPIO0): ");
-  Serial.println(digitalRead(ZOOM_ENDSTOP_MAX) == HIGH ? "HIGH (not triggered)" : "LOW (triggered)");
-
-  Serial.println("[INFO] Communication protocols:");
-  Serial.println("  1. Text commands (backward compatible):");
-  Serial.println("     - focus_stop, focus_forward, focus_back");
-  Serial.println("     - zoom_stop, zoom_forward, zoom_back");
-  Serial.println("     - focus_speed <0-255>, zoom_speed <0-255>");
-  Serial.println("  2. Binary struct (2 bytes):");
-  Serial.println("     - Byte 0: focus (-127 to +127)");
-  Serial.println("     - Byte 1: zoom (-127 to +127)");
-  Serial.println("     - Positive=forward, Negative=backward, 0=stop");
-  Serial.println("     - Magnitude=speed (1-127 maps to 35%-100% duty cycle)");
-  Serial.println("[INFO] Ready to receive commands...");
-  Serial.println("========================================");
-
-  // Initialize last states with current readings
-  focusMinLastState = digitalRead(FOCUS_ENDSTOP_MIN);
-  focusMaxLastState = digitalRead(FOCUS_ENDSTOP_MAX);
-  zoomMinLastState = digitalRead(ZOOM_ENDSTOP_MIN);
-  zoomMaxLastState = digitalRead(ZOOM_ENDSTOP_MAX);
+    lastStatusMs = millis();
 }
+
+// ── loop() ───────────────────────────────────────────────────────────────────
 
 void loop() {
-  // Check if data is available on serial port
-  if (Serial.available() >= sizeof(MotorCommand)) {
-    // Peek at first byte to determine if it's binary or text
-    uint8_t firstByte = Serial.peek();
+    uint32_t now = millis();
 
-    // Binary commands will have values in range [-127, 127]
-    // Text commands will be ASCII characters (typically >= 0x20 or printable)
-    if (firstByte <= 127 || firstByte >= 129) {
-      // Could be binary - check if looks like valid motor command
-      uint8_t buffer[2];
-      Serial.readBytes(buffer, 2);
+    // ── Inbound COBS frame accumulation ──────────────────────────────────────
 
-      // Reinterpret as signed values
-      int8_t focus = (int8_t)buffer[0];
-      int8_t zoom = (int8_t)buffer[1];
+    while (Serial.available() > 0) {
+        uint8_t b = (uint8_t)Serial.read();
+        if (b == 0x00) {
+            // Frame delimiter — attempt decode
+            if (rxLen > 0) {
+                uint8_t decoded[16];
+                size_t  dLen = cobsDecode(rxBuf, rxLen, decoded);
 
-      // If both values are in valid range or look like text, process accordingly
-      if ((buffer[0] >= 0x20 && buffer[0] <= 0x7E) && (buffer[1] >= 0x20 && buffer[1] <= 0x7E)) {
-        // Looks like ASCII text, add to command buffer
-        commandBuffer += (char)buffer[0];
-        if (buffer[1] == '\n' || buffer[1] == '\r') {
-          if (commandBuffer.length() > 0) {
-            processCommand(commandBuffer);
-            commandBuffer = "";
-          }
+                if (dLen == sizeof(FinderCommand)) {
+                    FinderCommand* cmd      = (FinderCommand*)decoded;
+                    uint8_t        expected = crc8(decoded, sizeof(FinderCommand) - 1);
+                    if (cmd->crc == expected) {
+                        firstFrameReceived = true;
+                        lastValidFrameMs   = now;
+                        watchdogTripped    = false;
+                        lastError          = 0;
+                        processMotorCommand(*cmd);
+                    } else {
+                        lastError = 3;  // bad_frame
+                    }
+                } else {
+                    lastError = 3;
+                }
+                rxLen = 0;
+            }
         } else {
-          commandBuffer += (char)buffer[1];
+            if (rxLen < sizeof(rxBuf))
+                rxBuf[rxLen++] = b;
+            else
+                rxLen = 0;  // overflow — discard and resync
         }
-      } else {
-        // Treat as binary command
-        MotorCommand cmd;
-        cmd.focus = focus;
-        cmd.zoom = zoom;
-        processMotorCommand(cmd);
-      }
-    } else {
-      // Definitely text - read character by character
-      char inChar = (char)Serial.read();
-      if (inChar == '\n' || inChar == '\r') {
-        if (commandBuffer.length() > 0) {
-          processCommand(commandBuffer);
-          commandBuffer = "";
+    }
+
+    // ── Software watchdog ─────────────────────────────────────────────────────
+
+    if (firstFrameReceived && !watchdogTripped && (now - lastValidFrameMs > WATCHDOG_TIMEOUT_MS)) {
+        focusStop();
+        zoomStop();
+        lastError      = 1;
+        watchdogTripped = true;
+    }
+
+    // ── Endstop polling with debounce ─────────────────────────────────────────
+
+    bool focusMinState = digitalRead(FOCUS_ENDSTOP_MIN);
+    if (focusMinState != focusMinLastState && (now - focusMinLastTriggerTime) > DEBOUNCE_DELAY_MS) {
+        if (focusMinState == LOW && focusMotorActive && focusMotorDirection == -1) {
+            focusStop();
+            focusActiveAccumMs = 0;  // known home position — reset pseudo-encoder
         }
-      } else {
-        commandBuffer += inChar;
-      }
+        focusMinLastState       = focusMinState;
+        focusMinLastTriggerTime = now;
     }
-  } else if (Serial.available() > 0) {
-    // Less than struct size available, process as text
-    char inChar = (char)Serial.read();
 
-    if (inChar == '\n' || inChar == '\r') {
-      if (commandBuffer.length() > 0) {
-        processCommand(commandBuffer);
-        commandBuffer = "";
-      }
-    } else {
-      commandBuffer += inChar;
+    bool focusMaxState = digitalRead(FOCUS_ENDSTOP_MAX);
+    if (focusMaxState != focusMaxLastState && (now - focusMaxLastTriggerTime) > DEBOUNCE_DELAY_MS) {
+        if (focusMaxState == LOW && focusMotorActive && focusMotorDirection == 1) {
+            focusStop();
+            focusActiveAccumMs = 0;
+        }
+        focusMaxLastState       = focusMaxState;
+        focusMaxLastTriggerTime = now;
     }
-  }
 
-  // Check optical endstops (LOW = optical contact/limit reached)
-  // ...existing code...
-  unsigned long currentTime = millis();
-
-  // Focus motor endstops
-  bool focusMinState = digitalRead(FOCUS_ENDSTOP_MIN);
-  if (focusMinState != focusMinLastState && (currentTime - focusMinLastTriggerTime) > DEBOUNCE_DELAY) {
-    if (focusMinState == LOW) {
-      // MIN endstop triggered - stop if moving backward
-      if (focusMotorActive && focusMotorDirection == -1) {
-        focusStop();
-      }
-      Serial.println("[ENDSTOP] Focus MIN endstop (GPIO2) triggered!");
-    } else {
-      Serial.println("[ENDSTOP] Focus MIN endstop (GPIO2) released");
+    bool zoomMinState = digitalRead(ZOOM_ENDSTOP_MIN);
+    if (zoomMinState != zoomMinLastState && (now - zoomMinLastTriggerTime) > DEBOUNCE_DELAY_MS) {
+        if (zoomMinState == LOW && zoomMotorActive && zoomMotorDirection == -1) {
+            zoomStop();
+            zoomActiveAccumMs = 0;
+        }
+        zoomMinLastState       = zoomMinState;
+        zoomMinLastTriggerTime = now;
     }
-    focusMinLastState = focusMinState;
-    focusMinLastTriggerTime = currentTime;
-  }
 
-  bool focusMaxState = digitalRead(FOCUS_ENDSTOP_MAX);
-  if (focusMaxState != focusMaxLastState && (currentTime - focusMaxLastTriggerTime) > DEBOUNCE_DELAY) {
-    if (focusMaxState == LOW) {
-      // MAX endstop triggered - stop if moving forward
-      if (focusMotorActive && focusMotorDirection == 1) {
-        focusStop();
-      }
-      Serial.println("[ENDSTOP] Focus MAX endstop (GPIO3) triggered!");
-    } else {
-      Serial.println("[ENDSTOP] Focus MAX endstop (GPIO3) released");
+    bool zoomMaxState = digitalRead(ZOOM_ENDSTOP_MAX);
+    if (zoomMaxState != zoomMaxLastState && (now - zoomMaxLastTriggerTime) > DEBOUNCE_DELAY_MS) {
+        if (zoomMaxState == LOW && zoomMotorActive && zoomMotorDirection == 1) {
+            zoomStop();
+            zoomActiveAccumMs = 0;
+        }
+        zoomMaxLastState       = zoomMaxState;
+        zoomMaxLastTriggerTime = now;
     }
-    focusMaxLastState = focusMaxState;
-    focusMaxLastTriggerTime = currentTime;
-  }
 
-  // Zoom motor endstops
-  bool zoomMinState = digitalRead(ZOOM_ENDSTOP_MIN);
-  if (zoomMinState != zoomMinLastState && (currentTime - zoomMinLastTriggerTime) > DEBOUNCE_DELAY) {
-    if (zoomMinState == LOW) {
-      // MIN endstop triggered - stop if moving backward
-      if (zoomMotorActive && zoomMotorDirection == -1) {
-        zoomStop();
-      }
-      Serial.println("[ENDSTOP] Zoom MIN endstop (GPIO1) triggered!");
-    } else {
-      Serial.println("[ENDSTOP] Zoom MIN endstop (GPIO1) released");
+    // ── Status broadcast at 10 Hz ─────────────────────────────────────────────
+
+    if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
+        sendStatus();
+        lastStatusMs = now;
     }
-    zoomMinLastState = zoomMinState;
-    zoomMinLastTriggerTime = currentTime;
-  }
 
-  bool zoomMaxState = digitalRead(ZOOM_ENDSTOP_MAX);
-  if (zoomMaxState != zoomMaxLastState && (currentTime - zoomMaxLastTriggerTime) > DEBOUNCE_DELAY) {
-    if (zoomMaxState == LOW) {
-      // MAX endstop triggered - stop if moving forward
-      if (zoomMotorActive && zoomMotorDirection == 1) {
-        zoomStop();
-      }
-      Serial.println("[ENDSTOP] Zoom MAX endstop (GPIO0) triggered!");
-    } else {
-      Serial.println("[ENDSTOP] Zoom MAX endstop (GPIO0) released");
-    }
-    zoomMaxLastState = zoomMaxState;
-    zoomMaxLastTriggerTime = currentTime;
-  }
-
-  // Small delay to prevent CPU overload
-  delay(10);
+    delay(10);
 }
-

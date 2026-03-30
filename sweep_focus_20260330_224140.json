@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-03-30T22:41:40.940914",
+  "motor": "focus",
+  "retries": 3,
+  "speeds": [
+    {
+      "speed_label": "slow",
+      "speed_val": 1,
+      "pwm_est": 90,
+      "runs_ms": [
+        11911,
+        11830,
+        11826
+      ],
+      "avg_ms": 11855,
+      "relative_pct": 55
+    },
+    {
+      "speed_label": "medium",
+      "speed_val": 63,
+      "pwm_est": 171,
+      "runs_ms": [
+        7606,
+        7611,
+        7608
+      ],
+      "avg_ms": 7608,
+      "relative_pct": 86
+    },
+    {
+      "speed_label": "fast",
+      "speed_val": 127,
+      "pwm_est": 255,
+      "runs_ms": [
+        6614,
+        6614,
+        6600
+      ],
+      "avg_ms": 6609,
+      "relative_pct": 100
+    }
+  ]
+}

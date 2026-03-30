@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-03-30T22:42:44.309235",
+  "motor": "zoom",
+  "retries": 3,
+  "speeds": [
+    {
+      "speed_label": "slow",
+      "speed_val": 1,
+      "pwm_est": 90,
+      "runs_ms": [
+        5292,
+        5202,
+        5101
+      ],
+      "avg_ms": 5198,
+      "relative_pct": 51
+    },
+    {
+      "speed_label": "medium",
+      "speed_val": 63,
+      "pwm_est": 171,
+      "runs_ms": [
+        3200,
+        3202,
+        3207
+      ],
+      "avg_ms": 3203,
+      "relative_pct": 84
+    },
+    {
+      "speed_label": "fast",
+      "speed_val": 127,
+      "pwm_est": 255,
+      "runs_ms": [
+        2690,
+        2706,
+        2697
+      ],
+      "avg_ms": 2697,
+      "relative_pct": 100
+    }
+  ]
+}

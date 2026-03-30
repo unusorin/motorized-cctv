@@ -1,440 +1,762 @@
 #!/usr/bin/env python3
 """
-Motorized CCTV - ESP32 Motor Controller - Pygame Keyboard Interface
-Controls focus and zoom motors via serial commands using arrow keys.
+Motorized Finder - ESP32 Motor Controller - Pygame Interface
+Controls focus and zoom motors via COBS-framed binary commands.
 
 Controls:
-- UP Arrow: Zoom Forward
-- DOWN Arrow: Zoom Backward
-- LEFT Arrow: Focus Backward
-- RIGHT Arrow: Focus Forward
-- ESC: Exit
-
-Communication Protocol:
-- Binary struct mode: Sends 2-byte MotorCommand struct for efficient control
-- Text mode (fallback): Sends text commands for debugging
+  RIGHT Arrow    Focus Forward
+  LEFT Arrow     Focus Backward
+  UP Arrow       Zoom Forward
+  DOWN Arrow     Zoom Backward
+  [ / ]          Decrease / Increase focus speed (step 10)
+  ; / '          Decrease / Increase zoom speed (step 10)
+  T              Run focus sweep test (min→max at slow/medium/fast speed)
+  Y              Run zoom sweep test
+  ESC            Exit / cancel test
 """
 
+import json
+import os
 import pygame
 import serial
 import serial.tools.list_ports
 import sys
 import time
 import struct
+from datetime import datetime
 
-# Serial configuration
+# ── Serial configuration ──────────────────────────────────────────────────────
+
 BAUD_RATE = 115200
-SERIAL_PORT = None  # Will be auto-detected or set manually
 
-# Communication mode
-USE_BINARY_PROTOCOL = True  # Set to False for text commands (debugging)
+# ── Colors ────────────────────────────────────────────────────────────────────
 
-# Colors for UI
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-GREEN = (0, 255, 0)
-RED = (255, 0, 0)
-BLUE = (0, 100, 255)
-GRAY = (100, 100, 100)
+BLACK      = (0,   0,   0)
+WHITE      = (255, 255, 255)
+GREEN      = (0,   220, 80)
+RED        = (220, 50,  50)
+BLUE       = (60,  140, 255)
+GRAY       = (80,  80,  80)
+DARK_GRAY  = (40,  40,  40)
+YELLOW     = (240, 200, 0)
+ORANGE     = (255, 140, 0)
+PANEL_BG   = (18,  18,  30)
+
+# ── Protocol helpers ──────────────────────────────────────────────────────────
+
+def crc8(data: bytes) -> int:
+    """CRC8 Dallas/Maxim, polynomial 0x31."""
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x31) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+def cobs_encode(data: bytes) -> bytes:
+    out      = bytearray()
+    code_idx = 0
+    out.append(0)
+    code = 1
+    for b in data:
+        if b == 0:
+            out[code_idx] = code
+            code_idx = len(out)
+            out.append(0)
+            code = 1
+        else:
+            out.append(b)
+            code += 1
+            if code == 0xFF:
+                out[code_idx] = code
+                code_idx = len(out)
+                out.append(0)
+                code = 1
+    out[code_idx] = code
+    out.append(0x00)
+    return bytes(out)
+
+
+def cobs_decode(data: bytes) -> bytes:
+    out = bytearray()
+    i   = 0
+    while i < len(data):
+        code = data[i]
+        if code == 0:
+            return b''
+        i += 1
+        for _ in range(code - 1):
+            if i >= len(data):
+                return b''
+            out.append(data[i])
+            i += 1
+        if code != 0xFF and i < len(data):
+            out.append(0)
+    return bytes(out)
+
+
+FINDER_STATUS_FMT  = '<BBBHHBBB'
+FINDER_STATUS_SIZE = struct.calcsize(FINDER_STATUS_FMT)  # 10
+
+ERROR_LABELS = {0: 'OK', 1: 'WATCHDOG', 2: 'ENDSTOP', 3: 'BAD FRAME'}
+
+
+# ── Motor controller ──────────────────────────────────────────────────────────
 
 class MotorController:
     def __init__(self):
         self.serial_connection = None
-        self.focus_state = "STOPPED"
-        self.zoom_state = "STOPPED"
-        self.connected = False
-        self.focus_direction = 0  # -1, 0, 1
-        self.zoom_direction = 0   # -1, 0, 1
+        self.connected         = False
+
+        self.focus_direction = 0
+        self.zoom_direction  = 0
+        self.focus_speed     = 50
+        self.zoom_speed      = 50
+
+        self.status = {
+            'flags': 0, 'endstops': 0, 'last_error': 0,
+            'focus_active_ms': 0, 'zoom_active_ms': 0,
+            'focus_pwm': 0, 'zoom_pwm': 0,
+        }
+        self._rx_buf = bytearray()
 
     def find_esp32_port(self):
-        """Auto-detect ESP32-C3 serial port"""
         ports = serial.tools.list_ports.comports()
-
         print("Available serial ports:")
-        for i, port in enumerate(ports):
-            print(f"  {i}: {port.device} - {port.description}")
-            # ESP32-C3 often shows up with these identifiers
-            if "USB" in port.description.upper() or "CP210" in port.description or "CH340" in port.description or "SERIAL" in port.description:
-                print(f"  -> Potential ESP32 device detected")
-
+        for p in ports:
+            print(f"  {p.device} — {p.description}")
+        for p in ports:
+            if any(k in p.description.upper() for k in ("USB", "SERIAL", "CP210", "CH340")):
+                print(f"Auto-selecting: {p.device}")
+                return p.device
+        if len(ports) == 1:
+            return ports[0].device
         if not ports:
             print("No serial ports found!")
             return None
-
-        # Try to auto-select
-        for port in ports:
-            if "USB" in port.description.upper() or "SERIAL" in port.description.upper():
-                print(f"\nAuto-selecting: {port.device}")
-                return port.device
-
-        # If no auto-detection, ask user
-        if len(ports) == 1:
-            print(f"\nUsing only available port: {ports[0].device}")
-            return ports[0].device
-        else:
-            try:
-                choice = int(input("\nEnter port number to use: "))
-                return ports[choice].device
-            except (ValueError, IndexError):
-                print("Invalid selection")
-                return None
+        try:
+            choice = int(input("Enter port number: "))
+            return ports[choice].device
+        except (ValueError, IndexError):
+            return None
 
     def connect(self, port=None):
-        """Connect to ESP32 via serial"""
         try:
             if port is None:
                 port = self.find_esp32_port()
-
             if port is None:
                 return False
-
-            self.serial_connection = serial.Serial(port, BAUD_RATE, timeout=1)
-            time.sleep(2)  # Wait for connection to stabilize
+            self.serial_connection = serial.Serial(port, BAUD_RATE, timeout=0)
+            time.sleep(2)
             self.connected = True
-            print(f"Connected to {port} at {BAUD_RATE} baud")
-
-            # Read any initial messages from ESP32
+            print(f"Connected to {port}")
             time.sleep(0.5)
-            while self.serial_connection.in_waiting:
-                line = self.serial_connection.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    print(f"ESP32: {line}")
-
+            self.serial_connection.reset_input_buffer()
             return True
         except serial.SerialException as e:
-            print(f"Error connecting to serial port: {e}")
+            print(f"Connection error: {e}")
             self.connected = False
             return False
 
     def disconnect(self):
-        """Disconnect from serial port"""
         if self.serial_connection and self.serial_connection.is_open:
-            # Send stop command using binary protocol
-            print("Stopping all motors before disconnect...")
-            if USE_BINARY_PROTOCOL:
-                self.send_motor_command_binary(0, 0)
-            else:
-                self.send_command("focus_stop")
-                self.send_command("zoom_stop")
-            # Give time for command to be processed
+            print("Stopping motors before disconnect...")
+            self._send(0, 0)
             time.sleep(0.2)
             self.serial_connection.close()
             self.connected = False
-            print("Disconnected from ESP32")
 
-    def send_motor_command_binary(self, focus, zoom):
-        """Send binary motor command struct to ESP32
-
-        Args:
-            focus: -127 to +127 (sign=direction, magnitude=speed, 0=stop)
-            zoom: -127 to +127 (sign=direction, magnitude=speed, 0=stop)
-        """
+    def _send(self, focus: int, zoom: int):
         if not self.connected or not self.serial_connection:
-            print(f"Not connected! Cannot send binary command")
-            return False
-
+            return
+        focus = max(-127, min(127, focus))
+        zoom  = max(-127, min(127, zoom))
+        fb, zb = focus & 0xFF, zoom & 0xFF
+        payload = bytes([fb, zb, crc8(bytes([fb, zb]))])
         try:
-            # Pack as binary struct: 2 bytes (int8, int8)
-            # Format: 'bb' = signed char, signed char
-            packed_data = struct.pack('bb', focus, zoom)
-            self.serial_connection.write(packed_data)
-
-            # Update internal state
-            if focus > 0:
-                self.focus_state = "FORWARD"
-                self.focus_direction = 1
-            elif focus < 0:
-                self.focus_state = "BACKWARD"
-                self.focus_direction = -1
-            else:
-                self.focus_state = "STOPPED"
-                self.focus_direction = 0
-
-            if zoom > 0:
-                self.zoom_state = "FORWARD"
-                self.zoom_direction = 1
-            elif zoom < 0:
-                self.zoom_state = "BACKWARD"
-                self.zoom_direction = -1
-            else:
-                self.zoom_state = "STOPPED"
-                self.zoom_direction = 0
-
-            print(f"Sent binary: Focus={focus:4d}, Zoom={zoom:4d}")
-            return True
+            self.serial_connection.write(cobs_encode(payload))
         except Exception as e:
-            print(f"Error sending binary command: {e}")
-            return False
+            print(f"Send error: {e}")
+            self.connected = False
 
-    def send_command(self, command):
-        """Send text command to ESP32 (backward compatibility)"""
-        if not self.connected or not self.serial_connection:
-            print(f"Not connected! Cannot send: {command}")
-            return False
-
-        try:
-            self.serial_connection.write(f"{command}\n".encode())
-            print(f"Sent: {command}")
-
-            # Update state tracking
-            if "focus" in command:
-                if "stop" in command:
-                    self.focus_state = "STOPPED"
-                    self.focus_direction = 0
-                elif "forward" in command:
-                    self.focus_state = "FORWARD"
-                    self.focus_direction = 1
-                elif "back" in command:
-                    self.focus_state = "BACKWARD"
-                    self.focus_direction = -1
-            elif "zoom" in command:
-                if "stop" in command:
-                    self.zoom_state = "STOPPED"
-                    self.zoom_direction = 0
-                elif "forward" in command:
-                    self.zoom_state = "FORWARD"
-                    self.zoom_direction = 1
-                elif "back" in command:
-                    self.zoom_state = "BACKWARD"
-                    self.zoom_direction = -1
-
-            return True
-        except Exception as e:
-            print(f"Error sending command: {e}")
-            return False
-
-    def update_motors(self, speed_multiplier=0.5):
-        """Send current motor state using binary protocol
-
-        Args:
-            speed_multiplier: Speed multiplier (0.5 = half speed, 1.0 = full speed)
-        """
-        if USE_BINARY_PROTOCOL:
-            # Map direction to signed value with speed multiplier
-            # Base speed is 127 (full), multiply by speed_multiplier
-            base_speed = int(127 * speed_multiplier)
-            focus = self.focus_direction * base_speed
-            zoom = self.zoom_direction * base_speed
-            self.send_motor_command_binary(focus, zoom)
-        else:
-            # Use text commands
-            if self.focus_direction == 1:
-                self.send_command("focus_forward")
-            elif self.focus_direction == -1:
-                self.send_command("focus_back")
-            elif self.focus_direction == 0:
-                self.send_command("focus_stop")
-
-            if self.zoom_direction == 1:
-                self.send_command("zoom_forward")
-            elif self.zoom_direction == -1:
-                self.send_command("zoom_back")
-            elif self.zoom_direction == 0:
-                self.send_command("zoom_stop")
+    def update_motors(self):
+        self._send(
+            self.focus_direction * self.focus_speed,
+            self.zoom_direction  * self.zoom_speed,
+        )
 
     def read_serial(self):
-        """Read and print any incoming serial data"""
-        if self.connected and self.serial_connection and self.serial_connection.in_waiting:
-            try:
-                line = self.serial_connection.readline().decode('utf-8', errors='ignore').strip()
-                if line:
-                    print(f"ESP32: {line}")
-            except Exception as e:
-                print(f"Error reading serial: {e}")
+        if not self.connected or not self.serial_connection:
+            return
+        try:
+            waiting = self.serial_connection.in_waiting
+            if waiting <= 0:
+                return
+            data = self.serial_connection.read(waiting)
+        except Exception as e:
+            print(f"Read error: {e}")
+            self.connected = False
+            return
+        for b in data:
+            if b == 0x00:
+                if self._rx_buf:
+                    self._parse_status(bytes(self._rx_buf))
+                    self._rx_buf.clear()
+            else:
+                self._rx_buf.append(b)
+                if len(self._rx_buf) > 32:
+                    self._rx_buf.clear()
 
+    def _parse_status(self, frame: bytes):
+        decoded = cobs_decode(frame)
+        if len(decoded) != FINDER_STATUS_SIZE:
+            return
+        fields = struct.unpack(FINDER_STATUS_FMT, decoded)
+        flags, endstops, last_error, f_ms, z_ms, f_pwm, z_pwm, crc_recv = fields
+        if crc_recv != crc8(decoded[:-1]):
+            return
+        self.status.update({
+            'flags': flags, 'endstops': endstops, 'last_error': last_error,
+            'focus_active_ms': f_ms, 'zoom_active_ms': z_ms,
+            'focus_pwm': f_pwm, 'zoom_pwm': z_pwm,
+        })
+
+    @property
+    def focus_active(self): return bool(self.status['flags'] & 0x01)
+    @property
+    def zoom_active(self):  return bool(self.status['flags'] & 0x02)
+    @property
+    def f_min(self): return bool(self.status['endstops'] & 0x01)
+    @property
+    def f_max(self): return bool(self.status['endstops'] & 0x02)
+    @property
+    def z_min(self): return bool(self.status['endstops'] & 0x04)
+    @property
+    def z_max(self): return bool(self.status['endstops'] & 0x08)
+
+
+# ── Sweep test ────────────────────────────────────────────────────────────────
+
+class SweepTest:
+    """
+    Endstop-to-endstop sweep test at three speeds, RETRIES runs each.
+    Sequence per speed: (home → settle → sweep) × RETRIES, then average.
+    Results: individual run times + average, saved to JSON on completion.
+    """
+
+    SPEEDS     = [('slow', 1), ('medium', 63), ('fast', 127)]
+    RETRIES    = 3
+    HOME_SPEED = 127
+    SETTLE_MS  = 400
+    TIMEOUT_MS = 25_000
+
+    def __init__(self):
+        self._reset()
+
+    def _reset(self):
+        self.running      = False
+        self.done         = False
+        self.motor        = None
+        self.state        = 'idle'
+        self.step_idx     = 0       # index into SPEEDS
+        self.retry_idx    = 0       # retry counter for current speed
+        self.current_runs = []      # elapsed_ms for retries of current speed
+        self.state_start  = 0
+        self.results      = []      # [(label, spd, [r1,r2,r3], avg_ms)]
+        self.error        = None
+        self.status_line  = ''
+
+    def start(self, ctrl, motor: str):
+        self._reset()
+        self.motor       = motor
+        self.running     = True
+        self.state       = 'homing'
+        self.state_start = pygame.time.get_ticks()
+        self.status_line = 'Homing to MIN...'
+        self._apply(ctrl)
+
+    def cancel(self, ctrl):
+        ctrl.focus_direction = 0
+        ctrl.zoom_direction  = 0
+        self._reset()
+
+    # -- per-frame update -----------------------------------------------------
+
+    def step(self, ctrl):
+        if not self.running:
+            return
+
+        now     = pygame.time.get_ticks()
+        elapsed = now - self.state_start
+        at_min  = ctrl.f_min if self.motor == 'focus' else ctrl.z_min
+        at_max  = ctrl.f_max if self.motor == 'focus' else ctrl.z_max
+
+        n_speeds = len(self.SPEEDS)
+
+        if self.state == 'homing':
+            if at_min:
+                self._go('settling', now, 'Settling...')
+            elif elapsed > self.TIMEOUT_MS:
+                self._fail(ctrl, 'Timeout: MIN endstop not reached')
+                return
+
+        elif self.state == 'settling':
+            if elapsed >= self.SETTLE_MS:
+                label, spd = self.SPEEDS[self.step_idx]
+                run_num    = self.retry_idx + 1
+                self._go('sweeping', now,
+                    f'Speed {self.step_idx+1}/{n_speeds} {label}  run {run_num}/{self.RETRIES}')
+
+        elif self.state == 'sweeping':
+            if at_max:
+                label, spd = self.SPEEDS[self.step_idx]
+                self.current_runs.append(elapsed)
+                self.retry_idx += 1
+
+                if self.retry_idx < self.RETRIES:
+                    # More retries for this speed — home again
+                    self._go('homing', now, 'Homing to MIN...')
+                else:
+                    # All retries done — compute average, move to next speed
+                    avg = int(sum(self.current_runs) / len(self.current_runs))
+                    self.results.append((label, spd, list(self.current_runs), avg))
+                    self.current_runs = []
+                    self.retry_idx    = 0
+                    self.step_idx    += 1
+
+                    if self.step_idx >= n_speeds:
+                        self.status_line = 'Complete!'
+                        self._finish(ctrl)
+                        return
+                    else:
+                        self._go('homing', now, 'Homing to MIN...')
+
+            elif elapsed > self.TIMEOUT_MS:
+                self._fail(ctrl, 'Timeout: MAX endstop not reached')
+                return
+
+        self._apply(ctrl)
+
+    # -- helpers --------------------------------------------------------------
+
+    def _go(self, state, now, text):
+        self.state       = state
+        self.state_start = now
+        self.status_line = text
+
+    def _apply(self, ctrl):
+        is_focus = self.motor == 'focus'
+        if self.state == 'homing':
+            spd = self.HOME_SPEED
+            if is_focus:
+                ctrl.focus_direction, ctrl.focus_speed = -1, spd
+                ctrl.zoom_direction = 0
+            else:
+                ctrl.zoom_direction, ctrl.zoom_speed = -1, spd
+                ctrl.focus_direction = 0
+        elif self.state == 'sweeping':
+            _, spd = self.SPEEDS[self.step_idx]
+            if is_focus:
+                ctrl.focus_direction, ctrl.focus_speed = 1, spd
+                ctrl.zoom_direction = 0
+            else:
+                ctrl.zoom_direction, ctrl.zoom_speed = 1, spd
+                ctrl.focus_direction = 0
+        else:  # settling / done
+            ctrl.focus_direction = 0
+            ctrl.zoom_direction  = 0
+
+    def _save_results(self):
+        ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = os.path.join(os.path.dirname(__file__), f'sweep_{self.motor}_{ts}.json')
+        avgs  = [r[3] for r in self.results if r[3] > 0]
+        min_t = min(avgs) if avgs else 1
+        data = {
+            'timestamp': datetime.now().isoformat(),
+            'motor':     self.motor,
+            'retries':   self.RETRIES,
+            'speeds': [
+                {
+                    'speed_label':  label,
+                    'speed_val':    spd,
+                    'pwm_est':      int(spd / 127 * (255 - 89) + 89) if spd > 0 else 0,
+                    'runs_ms':      runs,
+                    'avg_ms':       avg,
+                    'relative_pct': int(min_t / avg * 100) if avg > 0 else 0,
+                }
+                for label, spd, runs, avg in self.results
+            ],
+        }
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"Results saved to {filename}")
+        self.saved_path = filename
+
+    def _finish(self, ctrl):
+        self.running         = False
+        self.done            = True
+        ctrl.focus_direction = 0
+        ctrl.zoom_direction  = 0
+        if self.results and not self.error:
+            self._save_results()
+
+    def _fail(self, ctrl, msg):
+        self.error       = msg
+        self.status_line = f'ERROR: {msg}'
+        self._finish(ctrl)
+
+
+# ── UI helpers ────────────────────────────────────────────────────────────────
+
+def draw_endstop(surface, font, x, y, label, triggered):
+    pygame.draw.circle(surface, RED if triggered else GRAY, (x, y + 8), 8)
+    surface.blit(font.render(label, True, WHITE), (x + 14, y))
+
+
+def draw_arrow_h(surface, color, cx, cy, direction):
+    d   = direction
+    pts = [(cx + d*14, cy), (cx - d*6, cy - 10), (cx - d*6, cy + 10)]
+    pygame.draw.polygon(surface, color, pts)
+
+
+def draw_arrow_v(surface, color, cx, cy, direction):
+    d   = direction
+    pts = [(cx, cy - d*14), (cx - 10, cy + d*6), (cx + 10, cy + d*6)]
+    pygame.draw.polygon(surface, color, pts)
+
+
+def draw_test_panel(surface, fonts, test: SweepTest, W):
+    """Draw the sweep test results panel."""
+    font_md, font_sm = fonts
+
+    RETRIES = SweepTest.RETRIES
+    PX, PY, PW, PH = 30, 160, W - 60, 330
+    panel = pygame.Surface((PW, PH), pygame.SRCALPHA)
+    panel.fill((18, 18, 30, 230))
+    surface.blit(panel, (PX, PY))
+    pygame.draw.rect(surface, BLUE, (PX, PY, PW, PH), 1)
+
+    motor_label = test.motor.upper() if test.motor else ''
+    title = font_md.render(f"{motor_label} SWEEP TEST  ({RETRIES} runs/speed)", True, YELLOW)
+    surface.blit(title, (PX + PW // 2 - title.get_width() // 2, PY + 8))
+
+    # Status line
+    status_col = RED if test.error else (GREEN if test.done else WHITE)
+    surface.blit(font_sm.render(test.status_line, True, status_col), (PX + 14, PY + 36))
+
+    # Progress: speed dots with retry sub-dots
+    for i, (lbl, _) in enumerate(SweepTest.SPEEDS):
+        done_spd = i < len(test.results)
+        curr_spd = (i == len(test.results)) and test.running
+        dot_col  = GREEN if done_spd else (YELLOW if curr_spd else GRAY)
+        cx = PX + 14 + i * (RETRIES * 14 + 20)
+        pygame.draw.circle(surface, dot_col, (cx, PY + 56), 6)
+        surface.blit(font_sm.render(lbl[0].upper(), True, dot_col), (cx + 9, PY + 50))
+        # retry sub-dots
+        for r in range(RETRIES):
+            done_r = done_spd or (curr_spd and r < test.retry_idx)
+            rcol   = GREEN if done_r else (YELLOW if (curr_spd and r == test.retry_idx) else GRAY)
+            pygame.draw.circle(surface, rcol, (cx + 22 + r * 12, PY + 56), 4)
+
+    # Column headers:  Speed | Val | R1 | R2 | R3 | Avg | Rel.
+    run_labels = [f'R{i+1}' for i in range(RETRIES)]
+    headers    = ['Speed', 'Val'] + run_labels + ['Avg ms', 'Rel.']
+    # x positions — distribute across PW
+    hx = [PX + 14, PX + 68] + [PX + 118 + i * 62 for i in range(RETRIES)] + \
+         [PX + 118 + RETRIES * 62, PX + 118 + RETRIES * 62 + 74]
+    hy = PY + 72
+    for txt, x in zip(headers, hx):
+        surface.blit(font_sm.render(txt, True, GRAY), (x, hy))
+    pygame.draw.line(surface, GRAY, (PX + 10, hy + 18), (PX + PW - 10, hy + 18), 1)
+
+    # Completed result rows
+    avgs  = [r[3] for r in test.results if r[3] > 0]
+    min_t = min(avgs) if avgs else 1
+
+    for row, (label, spd, runs, avg) in enumerate(test.results):
+        ry      = hy + 24 + row * 30
+        rel     = int(min_t / avg * 100) if avg > 0 else 0
+        bar_w   = int(rel / 100 * 60)
+        vals    = [label, str(spd)] + [str(r) for r in runs] + [str(avg), '']
+        for val, x in zip(vals, hx):
+            surface.blit(font_sm.render(val, True, WHITE), (x, ry))
+        pygame.draw.rect(surface, DARK_GRAY, (hx[-1], ry + 2, 60, 14))
+        pygame.draw.rect(surface, GREEN,     (hx[-1], ry + 2, bar_w, 14))
+        surface.blit(font_sm.render(f'{rel}%', True, WHITE), (hx[-1] + 66, ry))
+
+    # In-progress row (current speed, partial retries)
+    curr_row = len(test.results)
+    if test.running and curr_row < len(SweepTest.SPEEDS):
+        ry    = hy + 24 + curr_row * 30
+        label, spd = SweepTest.SPEEDS[curr_row]
+        partial    = test.current_runs + ['…'] * (RETRIES - len(test.current_runs))
+        vals       = [label, str(spd)] + [str(v) for v in partial] + ['…', '']
+        for val, x in zip(vals, hx):
+            col = YELLOW if val == '…' else WHITE
+            surface.blit(font_sm.render(val, True, col), (x, ry))
+
+    # Pending rows
+    for row in range(curr_row + (1 if test.running else 0), len(SweepTest.SPEEDS)):
+        ry    = hy + 24 + row * 30
+        label = SweepTest.SPEEDS[row][0]
+        surface.blit(font_sm.render(label, True, GRAY), (hx[0], ry))
+        for x in hx[2:]:
+            surface.blit(font_sm.render('—', True, GRAY), (x, ry))
+
+    # Saved path
+    if test.done and not test.error and hasattr(test, 'saved_path'):
+        surface.blit(
+            font_sm.render(f"Saved: {os.path.basename(test.saved_path)}", True, GRAY),
+            (PX + 14, PY + PH - 38))
+
+    # Dismiss hint
+    hint_col = WHITE if test.done or test.error else GRAY
+    surface.blit(
+        font_sm.render(
+            'ESC to cancel' if test.running else 'T/Y to rerun  ESC to dismiss',
+            True, hint_col),
+        (PX + PW // 2 - font_sm.size('T/Y to rerun  ESC to dismiss')[0] // 2, PY + PH - 20))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # Initialize Pygame
     pygame.init()
+    W, H   = 640, 520
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Motorized Finder Controller")
 
-    # Set up display
-    screen_width = 600
-    screen_height = 400
-    screen = pygame.display.set_mode((screen_width, screen_height))
-    pygame.display.set_caption("Motorized CCTV Controller")
+    font_lg = pygame.font.Font(None, 42)
+    font_md = pygame.font.Font(None, 30)
+    font_sm = pygame.font.Font(None, 22)
 
-    # Font
-    font_large = pygame.font.Font(None, 48)
-    font_medium = pygame.font.Font(None, 32)
-    font_small = pygame.font.Font(None, 24)
+    ctrl = MotorController()
+    test = SweepTest()
 
-    # Initialize motor controller
-    controller = MotorController()
+    print("\n" + "=" * 50)
+    print("Motorized Finder Controller")
+    print("=" * 50)
 
-    print("\n" + "="*50)
-    print("Motorized CCTV Controller - Pygame Interface")
-    print("="*50)
-
-    if not controller.connect():
-        print("Failed to connect to ESP32. Exiting...")
+    if not ctrl.connect():
+        print("Failed to connect. Exiting.")
         pygame.quit()
         sys.exit(1)
 
-    # Track key states
-    keys_pressed = {
-        pygame.K_UP: False,
-        pygame.K_DOWN: False,
-        pygame.K_LEFT: False,
-        pygame.K_RIGHT: False
+    keys_held = {
+        pygame.K_RIGHT: False,
+        pygame.K_LEFT:  False,
+        pygame.K_UP:    False,
+        pygame.K_DOWN:  False,
     }
 
-    # Track shift key for speed control
-    shift_pressed = False
-
-    clock = pygame.time.Clock()
+    clock   = pygame.time.Clock()
     running = True
 
     print("\nControls:")
-    print("  UP Arrow    = Zoom Forward")
-    print("  DOWN Arrow  = Zoom Backward")
-    print("  LEFT Arrow  = Focus Backward")
-    print("  RIGHT Arrow = Focus Forward")
-    print("  SHIFT       = Full Speed (default is 20% speed)")
-    print("  ESC         = Exit")
-    print(f"\nProtocol: {'Binary struct' if USE_BINARY_PROTOCOL else 'Text commands'}")
-    print("Press and hold arrow keys to control motors...")
+    print("  ←/→  Focus    ↑/↓  Zoom    [/]  focus speed    ;/'  zoom speed")
+    print("  T  Focus sweep test    Y  Zoom sweep test    ESC  Exit")
 
     while running:
-        # Check shift key state
-        keys = pygame.key.get_pressed()
-        shift_pressed = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
-        speed_multiplier = 1.0 if shift_pressed else 0.2
-
-        # Handle events
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
 
             elif event.type == pygame.KEYDOWN:
-                # Exit on ESC
                 if event.key == pygame.K_ESCAPE:
-                    running = False
+                    if test.running:
+                        test.cancel(ctrl)
+                    elif test.done or test.error:
+                        test._reset()
+                    else:
+                        running = False
 
-                # Zoom controls (UP/DOWN)
-                elif event.key == pygame.K_UP and not keys_pressed[pygame.K_UP]:
-                    keys_pressed[pygame.K_UP] = True
-                    controller.zoom_direction = 1
-                    controller.update_motors(speed_multiplier)
+                # Sweep tests
+                elif event.key == pygame.K_t:
+                    test.start(ctrl, 'focus')
 
-                elif event.key == pygame.K_DOWN and not keys_pressed[pygame.K_DOWN]:
-                    keys_pressed[pygame.K_DOWN] = True
-                    controller.zoom_direction = -1
-                    controller.update_motors(speed_multiplier)
+                elif event.key == pygame.K_y:
+                    test.start(ctrl, 'zoom')
 
-                # Focus controls (LEFT/RIGHT)
-                elif event.key == pygame.K_LEFT and not keys_pressed[pygame.K_LEFT]:
-                    keys_pressed[pygame.K_LEFT] = True
-                    controller.focus_direction = -1
-                    controller.update_motors(speed_multiplier)
+                # Movement keys — blocked while test running
+                elif not test.running:
+                    if event.key == pygame.K_RIGHT and not keys_held[pygame.K_RIGHT]:
+                        keys_held[pygame.K_RIGHT] = True
+                        ctrl.focus_direction = 1
+                        ctrl.update_motors()
+                    elif event.key == pygame.K_LEFT and not keys_held[pygame.K_LEFT]:
+                        keys_held[pygame.K_LEFT] = True
+                        ctrl.focus_direction = -1
+                        ctrl.update_motors()
+                    elif event.key == pygame.K_UP and not keys_held[pygame.K_UP]:
+                        keys_held[pygame.K_UP] = True
+                        ctrl.zoom_direction = 1
+                        ctrl.update_motors()
+                    elif event.key == pygame.K_DOWN and not keys_held[pygame.K_DOWN]:
+                        keys_held[pygame.K_DOWN] = True
+                        ctrl.zoom_direction = -1
+                        ctrl.update_motors()
+                    elif event.key == pygame.K_LEFTBRACKET:
+                        ctrl.focus_speed = max(1, ctrl.focus_speed - 10)
+                        if ctrl.focus_direction != 0:
+                            ctrl.update_motors()
+                    elif event.key == pygame.K_RIGHTBRACKET:
+                        ctrl.focus_speed = min(127, ctrl.focus_speed + 10)
+                        if ctrl.focus_direction != 0:
+                            ctrl.update_motors()
+                    elif event.key == pygame.K_SEMICOLON:
+                        ctrl.zoom_speed = max(1, ctrl.zoom_speed - 10)
+                        if ctrl.zoom_direction != 0:
+                            ctrl.update_motors()
+                    elif event.key == pygame.K_QUOTE:
+                        ctrl.zoom_speed = min(127, ctrl.zoom_speed + 10)
+                        if ctrl.zoom_direction != 0:
+                            ctrl.update_motors()
 
-                elif event.key == pygame.K_RIGHT and not keys_pressed[pygame.K_RIGHT]:
-                    keys_pressed[pygame.K_RIGHT] = True
-                    controller.focus_direction = 1
-                    controller.update_motors(speed_multiplier)
+            elif event.type == pygame.KEYUP and not test.running:
+                if event.key == pygame.K_RIGHT and keys_held[pygame.K_RIGHT]:
+                    keys_held[pygame.K_RIGHT] = False
+                    ctrl.focus_direction = 0
+                    ctrl.update_motors()
+                elif event.key == pygame.K_LEFT and keys_held[pygame.K_LEFT]:
+                    keys_held[pygame.K_LEFT] = False
+                    ctrl.focus_direction = 0
+                    ctrl.update_motors()
+                elif event.key == pygame.K_UP and keys_held[pygame.K_UP]:
+                    keys_held[pygame.K_UP] = False
+                    ctrl.zoom_direction = 0
+                    ctrl.update_motors()
+                elif event.key == pygame.K_DOWN and keys_held[pygame.K_DOWN]:
+                    keys_held[pygame.K_DOWN] = False
+                    ctrl.zoom_direction = 0
+                    ctrl.update_motors()
 
-                # Update speed when shift is pressed while motor is running
-                elif event.key in [pygame.K_LSHIFT, pygame.K_RSHIFT]:
-                    if controller.focus_direction != 0 or controller.zoom_direction != 0:
-                        controller.update_motors(1.0)
+        # Advance test state machine
+        test.step(ctrl)
 
-            elif event.type == pygame.KEYUP:
-                # Stop motors when keys released
-                if event.key == pygame.K_UP and keys_pressed[pygame.K_UP]:
-                    keys_pressed[pygame.K_UP] = False
-                    controller.zoom_direction = 0
-                    controller.update_motors(speed_multiplier)
+        # Continuous motor command (watchdog keepalive + sustained movement)
+        ctrl.update_motors()
 
-                elif event.key == pygame.K_DOWN and keys_pressed[pygame.K_DOWN]:
-                    keys_pressed[pygame.K_DOWN] = False
-                    controller.zoom_direction = 0
-                    controller.update_motors(speed_multiplier)
+        # Read incoming FinderStatus frames
+        ctrl.read_serial()
 
-                elif event.key == pygame.K_LEFT and keys_pressed[pygame.K_LEFT]:
-                    keys_pressed[pygame.K_LEFT] = False
-                    controller.focus_direction = 0
-                    controller.update_motors(speed_multiplier)
-
-                elif event.key == pygame.K_RIGHT and keys_pressed[pygame.K_RIGHT]:
-                    keys_pressed[pygame.K_RIGHT] = False
-                    controller.focus_direction = 0
-                    controller.update_motors(speed_multiplier)
-
-                # Update speed when shift is released while motor is running
-                elif event.key in [pygame.K_LSHIFT, pygame.K_RSHIFT]:
-                    if controller.focus_direction != 0 or controller.zoom_direction != 0:
-                        controller.update_motors(0.2)
-
-        # Read any serial feedback
-        controller.read_serial()
-
-        # Draw UI
+        # ── Draw ─────────────────────────────────────────────────────────────
         screen.fill(BLACK)
 
         # Title
-        title = font_large.render("CCTV Controller", True, WHITE)
-        screen.blit(title, (screen_width//2 - title.get_width()//2, 20))
+        t = font_lg.render("Finder Controller", True, WHITE)
+        screen.blit(t, (W // 2 - t.get_width() // 2, 12))
 
-        # Connection status
-        status_text = "Connected" if controller.connected else "Disconnected"
-        status_color = GREEN if controller.connected else RED
-        status = font_small.render(f"Status: {status_text}", True, status_color)
-        screen.blit(status, (20, 80))
+        # Connection + error
+        conn_txt = font_sm.render(
+            'Connected' if ctrl.connected else 'Disconnected',
+            True, GREEN if ctrl.connected else RED)
+        screen.blit(conn_txt, (20, 58))
 
-        # Speed indicator
-        speed_text = "FULL SPEED" if shift_pressed else "20% SPEED"
-        speed_color = RED if shift_pressed else BLUE
-        speed_display = font_small.render(f"Speed: {speed_text}", True, speed_color)
-        screen.blit(speed_display, (20, 110))
+        err_code  = ctrl.status['last_error']
+        err_label = ERROR_LABELS.get(err_code, f'ERR {err_code}')
+        err_color = GREEN if err_code == 0 else (YELLOW if err_code == 2 else RED)
+        err_txt   = font_sm.render(f"Status: {err_label}", True, err_color)
+        screen.blit(err_txt, (W - err_txt.get_width() - 20, 58))
 
-        # Focus motor status
-        focus_label = font_medium.render("FOCUS:", True, WHITE)
-        screen.blit(focus_label, (50, 150))
+        # ── FOCUS section ─────────────────────────────────────────────────────
+        pygame.draw.line(screen, DARK_GRAY, (20, 82), (W - 20, 82), 1)
 
-        focus_color = GREEN if controller.focus_state != "STOPPED" else GRAY
-        focus_status = font_medium.render(controller.focus_state, True, focus_color)
-        screen.blit(focus_status, (180, 150))
+        screen.blit(font_md.render("FOCUS", True, WHITE), (20, 90))
+        fstate_txt = font_md.render(
+            "ACTIVE" if ctrl.focus_active else "STOPPED",
+            True, GREEN if ctrl.focus_active else GRAY)
+        screen.blit(fstate_txt, (110, 90))
+        screen.blit(font_sm.render(
+            f"speed {ctrl.focus_speed}/127  ([/] to adjust)", True, BLUE), (270, 94))
 
-        # Draw LEFT/RIGHT arrows for focus
-        left_color = BLUE if keys_pressed[pygame.K_LEFT] else GRAY
-        right_color = BLUE if keys_pressed[pygame.K_RIGHT] else GRAY
+        left_col  = BLUE if keys_held[pygame.K_LEFT]  else GRAY
+        right_col = BLUE if keys_held[pygame.K_RIGHT] else GRAY
+        draw_arrow_h(screen, left_col,  80,  145, -1)
+        draw_arrow_h(screen, right_col, 560, 145,  1)
 
-        pygame.draw.polygon(screen, left_color, [(120, 200), (150, 180), (150, 220)])  # Left arrow
-        pygame.draw.polygon(screen, right_color, [(430, 200), (400, 180), (400, 220)])  # Right arrow
+        dir_lbl = {-1: "← BACK", 0: "STOPPED", 1: "FWD →"}.get(ctrl.focus_direction, "")
+        dir_txt = font_md.render(dir_lbl, True, WHITE if ctrl.focus_direction else GRAY)
+        screen.blit(dir_txt, (W // 2 - dir_txt.get_width() // 2, 136))
 
-        # Zoom motor status
-        zoom_label = font_medium.render("ZOOM:", True, WHITE)
-        screen.blit(zoom_label, (50, 270))
+        pwm_w = int(ctrl.status['focus_pwm'] / 255 * 200)
+        pygame.draw.rect(screen, DARK_GRAY, (210, 160, 200, 10))
+        pygame.draw.rect(screen, GREEN,     (210, 160, pwm_w, 10))
+        screen.blit(font_sm.render(f"PWM {ctrl.status['focus_pwm']}", True, GRAY), (418, 157))
 
-        zoom_color = GREEN if controller.zoom_state != "STOPPED" else GRAY
-        zoom_status = font_medium.render(controller.zoom_state, True, zoom_color)
-        screen.blit(zoom_status, (180, 270))
+        draw_endstop(screen, font_sm, 120, 178, "F-MIN", ctrl.f_min)
+        draw_endstop(screen, font_sm, 250, 178, "F-MAX", ctrl.f_max)
+        screen.blit(font_sm.render(
+            f"active {ctrl.status['focus_active_ms']} ms", True, GRAY), (420, 178))
 
-        # Draw UP/DOWN arrows for zoom
-        up_color = BLUE if keys_pressed[pygame.K_UP] else GRAY
-        down_color = BLUE if keys_pressed[pygame.K_DOWN] else GRAY
+        # ── ZOOM section ──────────────────────────────────────────────────────
+        pygame.draw.line(screen, DARK_GRAY, (20, 210), (W - 20, 210), 1)
 
-        pygame.draw.polygon(screen, up_color, [(275, 180), (255, 210), (295, 210)])  # Up arrow
-        pygame.draw.polygon(screen, down_color, [(275, 340), (255, 310), (295, 310)])  # Down arrow
+        screen.blit(font_md.render("ZOOM", True, WHITE), (20, 218))
+        zstate_txt = font_md.render(
+            "ACTIVE" if ctrl.zoom_active else "STOPPED",
+            True, GREEN if ctrl.zoom_active else GRAY)
+        screen.blit(zstate_txt, (110, 218))
+        screen.blit(font_sm.render(
+            f"speed {ctrl.zoom_speed}/127  (;/' to adjust)", True, BLUE), (270, 222))
 
-        # Instructions
-        esc_text = font_small.render("Press ESC to exit", True, WHITE)
-        screen.blit(esc_text, (screen_width//2 - esc_text.get_width()//2, 370))
+        up_col   = BLUE if keys_held[pygame.K_UP]   else GRAY
+        down_col = BLUE if keys_held[pygame.K_DOWN] else GRAY
+        draw_arrow_v(screen, up_col,   80, 268, +1)
+        draw_arrow_v(screen, down_col, 80, 310, -1)
 
-        # Update display
+        zdir_lbl = {-1: "↓ BACK", 0: "STOPPED", 1: "FWD ↑"}.get(ctrl.zoom_direction, "")
+        zdir_txt = font_md.render(zdir_lbl, True, WHITE if ctrl.zoom_direction else GRAY)
+        screen.blit(zdir_txt, (W // 2 - zdir_txt.get_width() // 2, 280))
+
+        zpwm_w = int(ctrl.status['zoom_pwm'] / 255 * 200)
+        pygame.draw.rect(screen, DARK_GRAY, (210, 300, 200, 10))
+        pygame.draw.rect(screen, GREEN,     (210, 300, zpwm_w, 10))
+        screen.blit(font_sm.render(f"PWM {ctrl.status['zoom_pwm']}", True, GRAY), (418, 297))
+
+        draw_endstop(screen, font_sm, 120, 318, "Z-MIN", ctrl.z_min)
+        draw_endstop(screen, font_sm, 250, 318, "Z-MAX", ctrl.z_max)
+        screen.blit(font_sm.render(
+            f"active {ctrl.status['zoom_active_ms']} ms", True, GRAY), (420, 318))
+
+        # ── Endstop summary ───────────────────────────────────────────────────
+        pygame.draw.line(screen, DARK_GRAY, (20, 350), (W - 20, 350), 1)
+        screen.blit(font_sm.render("Endstops:", True, GRAY), (20, 358))
+        draw_endstop(screen, font_sm, 110, 355, "F-MIN", ctrl.f_min)
+        draw_endstop(screen, font_sm, 210, 355, "F-MAX", ctrl.f_max)
+        draw_endstop(screen, font_sm, 310, 355, "Z-MIN", ctrl.z_min)
+        draw_endstop(screen, font_sm, 410, 355, "Z-MAX", ctrl.z_max)
+
+        # ── Key hints ─────────────────────────────────────────────────────────
+        pygame.draw.line(screen, DARK_GRAY, (20, 385), (W - 20, 385), 1)
+        hints = [
+            ("←/→", "focus"), ("↑/↓", "zoom"),
+            ("[/]", "focus spd"), (";/'", "zoom spd"),
+            ("T", "focus test"), ("Y", "zoom test"), ("ESC", "exit"),
+        ]
+        hx = 20
+        for key, desc in hints:
+            kt = font_sm.render(key, True, YELLOW)
+            dt = font_sm.render(f" {desc}   ", True, GRAY)
+            screen.blit(kt, (hx, 393))
+            screen.blit(dt, (hx + kt.get_width(), 393))
+            hx += kt.get_width() + dt.get_width()
+
+        # ── Test panel overlay ────────────────────────────────────────────────
+        if test.running or test.done or test.error:
+            draw_test_panel(screen, (font_md, font_sm), test, W)
+
         pygame.display.flip()
-        clock.tick(60)  # 60 FPS
+        clock.tick(60)
 
-    # Cleanup
-    controller.disconnect()
+    ctrl.disconnect()
     pygame.quit()
-    print("\nExited successfully")
+    print("Exited.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nInterrupted by user")
         pygame.quit()
         sys.exit(0)
-
