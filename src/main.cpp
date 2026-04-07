@@ -418,7 +418,6 @@ void loop() {
     if (focusMaxState != focusMaxLastState && (now - focusMaxLastTriggerTime) > DEBOUNCE_DELAY_MS) {
         if (focusMaxState == LOW && focusMotorActive && focusMotorDirection == 1) {
             focusStop();
-            focusActiveAccumMs = 0;
         }
         focusMaxLastState       = focusMaxState;
         focusMaxLastTriggerTime = now;
@@ -438,7 +437,6 @@ void loop() {
     if (zoomMaxState != zoomMaxLastState && (now - zoomMaxLastTriggerTime) > DEBOUNCE_DELAY_MS) {
         if (zoomMaxState == LOW && zoomMotorActive && zoomMotorDirection == 1) {
             zoomStop();
-            zoomActiveAccumMs = 0;
         }
         zoomMaxLastState       = zoomMaxState;
         zoomMaxLastTriggerTime = now;
