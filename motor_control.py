@@ -10,9 +10,14 @@ Controls:
   DOWN Arrow     Zoom Backward
   [ / ]          Decrease / Increase focus speed (step 10)
   ; / '          Decrease / Increase zoom speed (step 10)
+  P              Toggle pulse mode (timed) / continuous mode
+  - / =          Decrease / Increase pulse duration (step 10ms, pulse mode only)
   T              Run focus sweep test (min→max at slow/medium/fast speed)
   Y              Run zoom sweep test
   ESC            Exit / cancel test
+
+  In pulse mode each arrow keypress fires a single timed command (default 150ms);
+  the motor self-stops after the duration — no key release required.
 """
 
 import json
@@ -109,10 +114,12 @@ class MotorController:
         self.serial_connection = None
         self.connected         = False
 
-        self.focus_direction = 0
-        self.zoom_direction  = 0
-        self.focus_speed     = 50
-        self.zoom_speed      = 50
+        self.focus_direction  = 0
+        self.zoom_direction   = 0
+        self.focus_speed      = 50
+        self.zoom_speed       = 50
+        self.pulse_mode       = False   # True = timed pulse, False = continuous
+        self.pulse_duration_ms = 150    # ms per pulse in pulse mode
 
         self.status = {
             'flags': 0, 'endstops': 0, 'last_error': 0,
@@ -167,13 +174,22 @@ class MotorController:
             self.serial_connection.close()
             self.connected = False
 
-    def _send(self, focus: int, zoom: int):
+    def _send(self, focus: int, zoom: int, duration_ms: int = 0):
         if not self.connected or not self.serial_connection:
             return
-        focus = max(-127, min(127, focus))
-        zoom  = max(-127, min(127, zoom))
+        focus       = max(-127, min(127, focus))
+        zoom        = max(-127, min(127, zoom))
+        duration_ms = max(0, min(65535, duration_ms))
+
+        # Track pulse timing to avoid stomping it with keepalives
+        if duration_ms > 0:
+            self._pulse_end_time = time.time() + (duration_ms / 1000.0)
+        else:
+            self._pulse_end_time = 0
+
         fb, zb = focus & 0xFF, zoom & 0xFF
-        payload = bytes([fb, zb, crc8(bytes([fb, zb]))])
+        data   = bytes([fb, zb]) + struct.pack('<H', duration_ms)
+        payload = data + bytes([crc8(data)])
         try:
             self.serial_connection.write(cobs_encode(payload))
         except Exception as e:
@@ -181,10 +197,30 @@ class MotorController:
             self.connected = False
 
     def update_motors(self):
-        self._send(
-            self.focus_direction * self.focus_speed,
-            self.zoom_direction  * self.zoom_speed,
-        )
+        # If we have an active direction (e.g. from continuous mode or a running test),
+        # we must send it.
+        if self.focus_direction != 0 or self.zoom_direction != 0:
+            self._send(
+                self.focus_direction * self.focus_speed,
+                self.zoom_direction  * self.zoom_speed,
+            )
+            return
+
+        # If we are in pulse mode and idle, avoid stomping on a running pulse.
+        if self.pulse_mode:
+            now = time.time()
+            # If a pulse is currently active on the ESP32, don't send anything.
+            if now < getattr(self, '_pulse_end_time', 0):
+                return
+
+            # To avoid triggering the hardware watchdog while idle,
+            # send a keepalive (0,0,0) every 250ms.
+            if now < getattr(self, '_last_keepalive', 0) + 0.25:
+                return
+            self._last_keepalive = now
+
+        # Continuous mode idle, or pulse mode idle (after pulse end/keepalive)
+        self._send(0, 0)
 
     def read_serial(self):
         if not self.connected or not self.serial_connection:
@@ -580,40 +616,75 @@ def main():
 
                 # Movement keys — blocked while test running
                 elif not test.running:
-                    if event.key == pygame.K_RIGHT and not keys_held[pygame.K_RIGHT]:
-                        keys_held[pygame.K_RIGHT] = True
-                        ctrl.focus_direction = 1
-                        ctrl.update_motors()
-                    elif event.key == pygame.K_LEFT and not keys_held[pygame.K_LEFT]:
-                        keys_held[pygame.K_LEFT] = True
-                        ctrl.focus_direction = -1
-                        ctrl.update_motors()
-                    elif event.key == pygame.K_UP and not keys_held[pygame.K_UP]:
-                        keys_held[pygame.K_UP] = True
-                        ctrl.zoom_direction = 1
-                        ctrl.update_motors()
-                    elif event.key == pygame.K_DOWN and not keys_held[pygame.K_DOWN]:
-                        keys_held[pygame.K_DOWN] = True
-                        ctrl.zoom_direction = -1
-                        ctrl.update_motors()
-                    elif event.key == pygame.K_LEFTBRACKET:
-                        ctrl.focus_speed = max(1, ctrl.focus_speed - 10)
-                        if ctrl.focus_direction != 0:
+                    if event.key == pygame.K_p:
+                        ctrl.pulse_mode = not ctrl.pulse_mode
+                        # Clear directions when switching to pulse mode to avoid carry-over
+                        if ctrl.pulse_mode:
+                            ctrl.focus_direction = 0
+                            ctrl.zoom_direction = 0
+                            for k in keys_held: keys_held[k] = False
+                        mode = f"PULSE ({ctrl.pulse_duration_ms}ms)" if ctrl.pulse_mode else "CONTINUOUS"
+                        print(f"Motor mode → {mode}")
+                    elif event.key == pygame.K_MINUS:
+                        ctrl.pulse_duration_ms = max(10, ctrl.pulse_duration_ms - 10)
+                        print(f"Pulse duration → {ctrl.pulse_duration_ms}ms")
+                    elif event.key == pygame.K_EQUALS:
+                        ctrl.pulse_duration_ms = min(2000, ctrl.pulse_duration_ms + 10)
+                        print(f"Pulse duration → {ctrl.pulse_duration_ms}ms")
+                    elif ctrl.pulse_mode:
+                        # Pulse mode: one timed command per keydown, no hold repeat needed
+                        if event.key == pygame.K_RIGHT:
+                            ctrl._send(ctrl.focus_speed, 0, ctrl.pulse_duration_ms)
+                        elif event.key == pygame.K_LEFT:
+                            ctrl._send(-ctrl.focus_speed, 0, ctrl.pulse_duration_ms)
+                        elif event.key == pygame.K_UP:
+                            ctrl._send(0, ctrl.zoom_speed, ctrl.pulse_duration_ms)
+                        elif event.key == pygame.K_DOWN:
+                            ctrl._send(0, -ctrl.zoom_speed, ctrl.pulse_duration_ms)
+                        elif event.key == pygame.K_LEFTBRACKET:
+                            ctrl.focus_speed = max(1, ctrl.focus_speed - 10)
+                        elif event.key == pygame.K_RIGHTBRACKET:
+                            ctrl.focus_speed = min(127, ctrl.focus_speed + 10)
+                        elif event.key == pygame.K_SEMICOLON:
+                            ctrl.zoom_speed = max(1, ctrl.zoom_speed - 10)
+                        elif event.key == pygame.K_QUOTE:
+                            ctrl.zoom_speed = min(127, ctrl.zoom_speed + 10)
+                    else:
+                        # Continuous mode: hold keys for sustained movement
+                        if event.key == pygame.K_RIGHT and not keys_held[pygame.K_RIGHT]:
+                            keys_held[pygame.K_RIGHT] = True
+                            ctrl.focus_direction = 1
                             ctrl.update_motors()
-                    elif event.key == pygame.K_RIGHTBRACKET:
-                        ctrl.focus_speed = min(127, ctrl.focus_speed + 10)
-                        if ctrl.focus_direction != 0:
+                        elif event.key == pygame.K_LEFT and not keys_held[pygame.K_LEFT]:
+                            keys_held[pygame.K_LEFT] = True
+                            ctrl.focus_direction = -1
                             ctrl.update_motors()
-                    elif event.key == pygame.K_SEMICOLON:
-                        ctrl.zoom_speed = max(1, ctrl.zoom_speed - 10)
-                        if ctrl.zoom_direction != 0:
+                        elif event.key == pygame.K_UP and not keys_held[pygame.K_UP]:
+                            keys_held[pygame.K_UP] = True
+                            ctrl.zoom_direction = 1
                             ctrl.update_motors()
-                    elif event.key == pygame.K_QUOTE:
-                        ctrl.zoom_speed = min(127, ctrl.zoom_speed + 10)
-                        if ctrl.zoom_direction != 0:
+                        elif event.key == pygame.K_DOWN and not keys_held[pygame.K_DOWN]:
+                            keys_held[pygame.K_DOWN] = True
+                            ctrl.zoom_direction = -1
                             ctrl.update_motors()
+                        elif event.key == pygame.K_LEFTBRACKET:
+                            ctrl.focus_speed = max(1, ctrl.focus_speed - 10)
+                            if ctrl.focus_direction != 0:
+                                ctrl.update_motors()
+                        elif event.key == pygame.K_RIGHTBRACKET:
+                            ctrl.focus_speed = min(127, ctrl.focus_speed + 10)
+                            if ctrl.focus_direction != 0:
+                                ctrl.update_motors()
+                        elif event.key == pygame.K_SEMICOLON:
+                            ctrl.zoom_speed = max(1, ctrl.zoom_speed - 10)
+                            if ctrl.zoom_direction != 0:
+                                ctrl.update_motors()
+                        elif event.key == pygame.K_QUOTE:
+                            ctrl.zoom_speed = min(127, ctrl.zoom_speed + 10)
+                            if ctrl.zoom_direction != 0:
+                                ctrl.update_motors()
 
-            elif event.type == pygame.KEYUP and not test.running:
+            elif event.type == pygame.KEYUP and not test.running and not ctrl.pulse_mode:
                 if event.key == pygame.K_RIGHT and keys_held[pygame.K_RIGHT]:
                     keys_held[pygame.K_RIGHT] = False
                     ctrl.focus_direction = 0
@@ -727,8 +798,19 @@ def main():
         draw_endstop(screen, font_sm, 310, 355, "Z-MIN", ctrl.z_min)
         draw_endstop(screen, font_sm, 410, 355, "Z-MAX", ctrl.z_max)
 
+        # ── Pulse mode indicator ──────────────────────────────────────────────
+        pygame.draw.line(screen, DARK_GRAY, (20, 378), (W - 20, 378), 1)
+        if ctrl.pulse_mode:
+            mode_str = f"PULSE MODE  {ctrl.pulse_duration_ms}ms  (-/= adjust)"
+            mode_col = YELLOW
+        else:
+            mode_str = "CONTINUOUS MODE"
+            mode_col = BLUE
+        screen.blit(font_sm.render(mode_str, True, mode_col), (20, 386))
+        screen.blit(font_sm.render("P = toggle mode", True, GRAY), (W - 160, 386))
+
         # ── Key hints ─────────────────────────────────────────────────────────
-        pygame.draw.line(screen, DARK_GRAY, (20, 385), (W - 20, 385), 1)
+        pygame.draw.line(screen, DARK_GRAY, (20, 406), (W - 20, 406), 1)
         hints = [
             ("←/→", "focus"), ("↑/↓", "zoom"),
             ("[/]", "focus spd"), (";/'", "zoom spd"),
@@ -738,8 +820,8 @@ def main():
         for key, desc in hints:
             kt = font_sm.render(key, True, YELLOW)
             dt = font_sm.render(f" {desc}   ", True, GRAY)
-            screen.blit(kt, (hx, 393))
-            screen.blit(dt, (hx + kt.get_width(), 393))
+            screen.blit(kt, (hx, 414))
+            screen.blit(dt, (hx + kt.get_width(), 414))
             hx += kt.get_width() + dt.get_width()
 
         # ── Test panel overlay ────────────────────────────────────────────────

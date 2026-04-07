@@ -3,9 +3,10 @@
 // ── Protocol structs ──────────────────────────────────────────────────────────
 
 struct FinderCommand {
-    int8_t  focus;  // -127..+127 (sign=direction, magnitude=speed)
-    int8_t  zoom;
-    uint8_t crc;    // CRC8 Dallas/Maxim over [focus, zoom]
+    int8_t   focus;        // -127..+127 (sign=direction, magnitude=speed)
+    int8_t   zoom;
+    uint16_t duration_ms;  // 0 = run until stopped; >0 = auto-stop after N ms
+    uint8_t  crc;          // CRC8 Dallas/Maxim over [focus, zoom, duration_ms]
 } __attribute__((packed));
 
 struct FinderStatus {
@@ -57,6 +58,13 @@ uint32_t focusActiveAccumMs = 0;   // accumulated ms while motor was driven
 uint32_t focusMoveStartMs   = 0;   // millis() when current run started
 uint32_t zoomActiveAccumMs  = 0;
 uint32_t zoomMoveStartMs    = 0;
+
+// ── Timed pulse state ─────────────────────────────────────────────────────────
+
+uint32_t focusPulseEndMs  = 0;
+bool     focusPulseActive = false;
+uint32_t zoomPulseEndMs   = 0;
+bool     zoomPulseActive  = false;
 
 // ── Endstop debounce ──────────────────────────────────────────────────────────
 
@@ -148,8 +156,8 @@ void focusStop() {
     if (focusMotorActive)
         focusActiveAccumMs += millis() - focusMoveStartMs;
 
-    ledcDetachPin(FOCUS_IN1);
-    ledcDetachPin(FOCUS_IN2);
+    ledcDetach(FOCUS_IN1);
+    ledcDetach(FOCUS_IN2);
     pinMode(FOCUS_IN1, OUTPUT);
     pinMode(FOCUS_IN2, OUTPUT);
     digitalWrite(FOCUS_IN1, HIGH);
@@ -158,14 +166,15 @@ void focusStop() {
     focusMotorActive    = false;
     focusMotorDirection = 0;
     focusMotorPwm       = 0;
+    focusPulseActive    = false;
 }
 
 void zoomStop() {
     if (zoomMotorActive)
         zoomActiveAccumMs += millis() - zoomMoveStartMs;
 
-    ledcDetachPin(ZOOM_IN3);
-    ledcDetachPin(ZOOM_IN4);
+    ledcDetach(ZOOM_IN3);
+    ledcDetach(ZOOM_IN4);
     pinMode(ZOOM_IN3, OUTPUT);
     pinMode(ZOOM_IN4, OUTPUT);
     digitalWrite(ZOOM_IN3, HIGH);
@@ -174,6 +183,7 @@ void zoomStop() {
     zoomMotorActive    = false;
     zoomMotorDirection = 0;
     zoomMotorPwm       = 0;
+    zoomPulseActive    = false;
 }
 
 // ── Motor move functions ──────────────────────────────────────────────────────
@@ -184,7 +194,7 @@ void focusForward(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetachPin(FOCUS_IN2);
+    ledcDetach(FOCUS_IN2);
     pinMode(FOCUS_IN2, OUTPUT);
     digitalWrite(FOCUS_IN2, LOW);
     analogWrite(FOCUS_IN1, pwm);
@@ -201,7 +211,7 @@ void focusBack(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetachPin(FOCUS_IN1);
+    ledcDetach(FOCUS_IN1);
     pinMode(FOCUS_IN1, OUTPUT);
     digitalWrite(FOCUS_IN1, LOW);
     analogWrite(FOCUS_IN2, pwm);
@@ -218,7 +228,7 @@ void zoomForward(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetachPin(ZOOM_IN3);
+    ledcDetach(ZOOM_IN3);
     pinMode(ZOOM_IN3, OUTPUT);
     digitalWrite(ZOOM_IN3, LOW);
     analogWrite(ZOOM_IN4, pwm);
@@ -235,7 +245,7 @@ void zoomBack(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetachPin(ZOOM_IN4);
+    ledcDetach(ZOOM_IN4);
     pinMode(ZOOM_IN4, OUTPUT);
     digitalWrite(ZOOM_IN4, LOW);
     analogWrite(ZOOM_IN3, pwm);
@@ -256,12 +266,26 @@ static void processMotorCommand(const FinderCommand& cmd) {
     else
         focusStop();
 
+    if (cmd.focus != 0 && cmd.duration_ms > 0) {
+        focusPulseEndMs  = millis() + cmd.duration_ms;
+        focusPulseActive = true;
+    } else {
+        focusPulseActive = false;
+    }
+
     if (cmd.zoom > 0)
         zoomForward((uint8_t)map(abs(cmd.zoom), 1, 127, 89, 255));
     else if (cmd.zoom < 0)
         zoomBack((uint8_t)map(abs(cmd.zoom), 1, 127, 89, 255));
     else
         zoomStop();
+
+    if (cmd.zoom != 0 && cmd.duration_ms > 0) {
+        zoomPulseEndMs  = millis() + cmd.duration_ms;
+        zoomPulseActive = true;
+    } else {
+        zoomPulseActive = false;
+    }
 }
 
 // ── Status frame transmission ─────────────────────────────────────────────────
@@ -370,6 +394,14 @@ void loop() {
         watchdogTripped = true;
     }
 
+    // ── Timed pulse expiry ────────────────────────────────────────────────────
+
+    if (focusPulseActive && now >= focusPulseEndMs)
+        focusStop();
+
+    if (zoomPulseActive && now >= zoomPulseEndMs)
+        zoomStop();
+
     // ── Endstop polling with debounce ─────────────────────────────────────────
 
     bool focusMinState = digitalRead(FOCUS_ENDSTOP_MIN);
@@ -419,5 +451,6 @@ void loop() {
         lastStatusMs = now;
     }
 
-    delay(10);
+    delay(1);
+    yield();
 }
