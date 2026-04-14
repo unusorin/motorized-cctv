@@ -1,12 +1,19 @@
 #include <Arduino.h>
 
 // ── Protocol structs ──────────────────────────────────────────────────────────
+//
+// FinderCommand (Pi → ESP32): 5 raw bytes, ~7 bytes once COBS-framed.
+//   focus, zoom:  int8_t direction+magnitude. 0 = stop. ±1..±127 maps linearly
+//                 to PWM 89..255 (35%..100% duty). Sign picks direction.
+//   duration_ms:  0 = run until the next command; >0 = firmware auto-stops the
+//                 affected motor(s) after N milliseconds (timed pulse).
+//   crc:          CRC8 Dallas/Maxim (poly 0x31) over [focus, zoom, duration_ms].
 
 struct FinderCommand {
-    int8_t   focus;        // -127..+127 (sign=direction, magnitude=speed)
+    int8_t   focus;
     int8_t   zoom;
-    uint16_t duration_ms;  // 0 = run until stopped; >0 = auto-stop after N ms
-    uint8_t  crc;          // CRC8 Dallas/Maxim over [focus, zoom, duration_ms]
+    uint16_t duration_ms;
+    uint8_t  crc;
 } __attribute__((packed));
 
 struct FinderStatus {
@@ -35,6 +42,14 @@ struct FinderStatus {
 
 #define PWM_FREQ       20000
 #define PWM_RESOLUTION 8
+
+// One LEDC channel per H-bridge input. Allocated in setup() via ledcSetup()
+// and bound to the corresponding GPIO with ledcAttachPin(), then driven with
+// ledcWrite(channel, duty) in the motor functions. arduino-esp32 v2.x API.
+#define FOCUS_IN1_CH 0
+#define FOCUS_IN2_CH 1
+#define ZOOM_IN3_CH  2
+#define ZOOM_IN4_CH  3
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 
@@ -84,7 +99,7 @@ uint32_t lastValidFrameMs   = 0;
 bool     watchdogTripped    = false;
 uint8_t  lastError          = 0;
 
-uint8_t  rxBuf[16];
+uint8_t  rxBuf[32];
 uint8_t  rxLen = 0;
 
 uint32_t lastStatusMs = 0;
@@ -156,12 +171,11 @@ void focusStop() {
     if (focusMotorActive)
         focusActiveAccumMs += millis() - focusMoveStartMs;
 
-    ledcDetach(FOCUS_IN1);
-    ledcDetach(FOCUS_IN2);
-    pinMode(FOCUS_IN1, OUTPUT);
-    pinMode(FOCUS_IN2, OUTPUT);
-    digitalWrite(FOCUS_IN1, HIGH);
-    digitalWrite(FOCUS_IN2, HIGH);
+    // MX1508 brake mode: both inputs HIGH. At 8-bit resolution the max duty
+    // (255) is ~99.6% HIGH — the 0.2 µs LOW sliver per 50 µs period is below
+    // the bridge's input response, so this is effectively a continuous brake.
+    ledcWrite(FOCUS_IN1_CH, 255);
+    ledcWrite(FOCUS_IN2_CH, 255);
 
     focusMotorActive    = false;
     focusMotorDirection = 0;
@@ -173,12 +187,8 @@ void zoomStop() {
     if (zoomMotorActive)
         zoomActiveAccumMs += millis() - zoomMoveStartMs;
 
-    ledcDetach(ZOOM_IN3);
-    ledcDetach(ZOOM_IN4);
-    pinMode(ZOOM_IN3, OUTPUT);
-    pinMode(ZOOM_IN4, OUTPUT);
-    digitalWrite(ZOOM_IN3, HIGH);
-    digitalWrite(ZOOM_IN4, HIGH);
+    ledcWrite(ZOOM_IN3_CH, 255);
+    ledcWrite(ZOOM_IN4_CH, 255);
 
     zoomMotorActive    = false;
     zoomMotorDirection = 0;
@@ -194,10 +204,14 @@ void focusForward(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetach(FOCUS_IN2);
-    pinMode(FOCUS_IN2, OUTPUT);
-    digitalWrite(FOCUS_IN2, LOW);
-    analogWrite(FOCUS_IN1, pwm);
+    // Route direction reversals through brake to avoid hammering the H-bridge
+    // with an undefined transient while one PWM pin tears down and the other
+    // spins up. Same-direction PWM changes skip the stop and just retune duty.
+    if (focusMotorActive && focusMotorDirection != 1)
+        focusStop();
+
+    ledcWrite(FOCUS_IN2_CH, 0);
+    ledcWrite(FOCUS_IN1_CH, pwm);
 
     if (!focusMotorActive) focusMoveStartMs = millis();
     focusMotorActive    = true;
@@ -211,10 +225,11 @@ void focusBack(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetach(FOCUS_IN1);
-    pinMode(FOCUS_IN1, OUTPUT);
-    digitalWrite(FOCUS_IN1, LOW);
-    analogWrite(FOCUS_IN2, pwm);
+    if (focusMotorActive && focusMotorDirection != -1)
+        focusStop();
+
+    ledcWrite(FOCUS_IN1_CH, 0);
+    ledcWrite(FOCUS_IN2_CH, pwm);
 
     if (!focusMotorActive) focusMoveStartMs = millis();
     focusMotorActive    = true;
@@ -228,10 +243,11 @@ void zoomForward(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetach(ZOOM_IN3);
-    pinMode(ZOOM_IN3, OUTPUT);
-    digitalWrite(ZOOM_IN3, LOW);
-    analogWrite(ZOOM_IN4, pwm);
+    if (zoomMotorActive && zoomMotorDirection != 1)
+        zoomStop();
+
+    ledcWrite(ZOOM_IN4_CH, 0);
+    ledcWrite(ZOOM_IN3_CH, pwm);
 
     if (!zoomMotorActive) zoomMoveStartMs = millis();
     zoomMotorActive    = true;
@@ -245,10 +261,11 @@ void zoomBack(uint8_t pwm) {
         lastError = 2;
         return;
     }
-    ledcDetach(ZOOM_IN4);
-    pinMode(ZOOM_IN4, OUTPUT);
-    digitalWrite(ZOOM_IN4, LOW);
-    analogWrite(ZOOM_IN3, pwm);
+    if (zoomMotorActive && zoomMotorDirection != -1)
+        zoomStop();
+
+    ledcWrite(ZOOM_IN3_CH, 0);
+    ledcWrite(ZOOM_IN4_CH, pwm);
 
     if (!zoomMotorActive) zoomMoveStartMs = millis();
     zoomMotorActive    = true;
@@ -324,15 +341,22 @@ void setup() {
     delay(2000);
     while (!Serial && millis() < 5000) delay(100);
 
-    pinMode(FOCUS_IN1, OUTPUT);
-    pinMode(FOCUS_IN2, OUTPUT);
-    pinMode(ZOOM_IN3,  OUTPUT);
-    pinMode(ZOOM_IN4,  OUTPUT);
-
     pinMode(FOCUS_ENDSTOP_MIN, INPUT_PULLUP);
     pinMode(FOCUS_ENDSTOP_MAX, INPUT_PULLUP);
     pinMode(ZOOM_ENDSTOP_MIN,  INPUT_PULLUP);
     pinMode(ZOOM_ENDSTOP_MAX,  INPUT_PULLUP);
+
+    // Allocate a dedicated LEDC channel per H-bridge input and bind the pin
+    // once, here in setup(). Motor functions then only call ledcWrite(ch, duty)
+    // — no per-call pin-mode / detach / attach dance.
+    ledcSetup(FOCUS_IN1_CH, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(FOCUS_IN1, FOCUS_IN1_CH);
+    ledcSetup(FOCUS_IN2_CH, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(FOCUS_IN2, FOCUS_IN2_CH);
+    ledcSetup(ZOOM_IN3_CH, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(ZOOM_IN3, ZOOM_IN3_CH);
+    ledcSetup(ZOOM_IN4_CH, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(ZOOM_IN4, ZOOM_IN4_CH);
 
     focusStop();
     zoomStop();
@@ -341,6 +365,13 @@ void setup() {
     focusMaxLastState = digitalRead(FOCUS_ENDSTOP_MAX);
     zoomMinLastState  = digitalRead(ZOOM_ENDSTOP_MIN);
     zoomMaxLastState  = digitalRead(ZOOM_ENDSTOP_MAX);
+
+    // Arm the software watchdog immediately: a stuck motor from a previous
+    // session (or any pre-comms fault) is now guaranteed to be force-stopped
+    // within WATCHDOG_TIMEOUT_MS even if the host never connects. The first
+    // valid command from the relay clears lastError back to 0.
+    lastValidFrameMs   = millis();
+    firstFrameReceived = true;
 
     lastStatusMs = millis();
 }
@@ -357,7 +388,7 @@ void loop() {
         if (b == 0x00) {
             // Frame delimiter — attempt decode
             if (rxLen > 0) {
-                uint8_t decoded[16];
+                uint8_t decoded[32];
                 size_t  dLen = cobsDecode(rxBuf, rxLen, decoded);
 
                 if (dLen == sizeof(FinderCommand)) {
@@ -378,10 +409,12 @@ void loop() {
                 rxLen = 0;
             }
         } else {
-            if (rxLen < sizeof(rxBuf))
+            if (rxLen < sizeof(rxBuf)) {
                 rxBuf[rxLen++] = b;
-            else
-                rxLen = 0;  // overflow — discard and resync
+            } else {
+                lastError = 3;  // bad_frame — overflow, resync
+                rxLen      = 0;
+            }
         }
     }
 
@@ -407,8 +440,11 @@ void loop() {
     bool focusMinState = digitalRead(FOCUS_ENDSTOP_MIN);
     if (focusMinState != focusMinLastState && (now - focusMinLastTriggerTime) > DEBOUNCE_DELAY_MS) {
         if (focusMinState == LOW && focusMotorActive && focusMotorDirection == -1) {
+            // Endstop = known home. Clear the active flag first so focusStop()
+            // skips its accumulator path, then zero the pseudo-encoder directly.
+            focusMotorActive   = false;
             focusStop();
-            focusActiveAccumMs = 0;  // known home position — reset pseudo-encoder
+            focusActiveAccumMs = 0;
         }
         focusMinLastState       = focusMinState;
         focusMinLastTriggerTime = now;
@@ -426,6 +462,7 @@ void loop() {
     bool zoomMinState = digitalRead(ZOOM_ENDSTOP_MIN);
     if (zoomMinState != zoomMinLastState && (now - zoomMinLastTriggerTime) > DEBOUNCE_DELAY_MS) {
         if (zoomMinState == LOW && zoomMotorActive && zoomMotorDirection == -1) {
+            zoomMotorActive   = false;
             zoomStop();
             zoomActiveAccumMs = 0;
         }
